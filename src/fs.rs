@@ -1,11 +1,14 @@
 use anyhow::Result;
 use aws_sdk_s3::{
-    Client, error::SdkError, operation::head_object::HeadObjectError, primitives::ByteStream,
-    types::CompletedPart,
+    Client,
+    error::SdkError,
+    operation::head_object::HeadObjectError,
+    primitives::ByteStream,
+    types::{CompletedMultipartUpload, CompletedPart},
 };
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, Request,
-    TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite, Request, TimeOrNow,
 };
 use std::{
     collections::HashMap,
@@ -40,7 +43,7 @@ enum WriteState {
 }
 
 fn path_to_ino(path: &Path) -> u64 {
-    // Inode 1 is special (root). Don't we dont ever generate it.
+    // Inode 1 is special (root). We dont ever generate it.
     // We hash the path string to get a unique u64.
     if path.as_os_str() == "/" {
         1
@@ -112,7 +115,7 @@ pub struct S3Fuse {
     rt: Runtime,
     ino_to_path_cache: HashMap<u64, PathBuf>,
     next_fh: u64,
-    open_files: Mutex<HashMap<u64, WriteState>>,
+    write_buffers: Mutex<HashMap<u64, Vec<u8>>>,
     mount_uid: u32,
     mount_gid: u32,
 }
@@ -137,26 +140,10 @@ impl S3Fuse {
                 m
             },
             next_fh: 1,
-            open_files: Mutex::new(HashMap::new()),
+            write_buffers: Mutex::new(HashMap::new()),
             mount_uid: 0,
             mount_gid: 0,
         })
-    }
-
-    /// Helper to bridge the sync FUSE world to the async S3 world.
-    /// It spawns the async task on the Tokio runtime and blocks the current
-    /// (FUSE) thread efficiently until the result is ready.
-    fn block_on_s3<F, T>(&self, future: F) -> T
-    where
-        F: std::future::Future<Output = T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.rt.spawn(async move {
-            let result = future.await;
-            let _ = tx.send(result);
-        });
-        rx.recv().expect("S3 task panicked or channel was closed")
     }
 
     async fn upload_part(
@@ -630,9 +617,9 @@ impl Filesystem for S3Fuse {
 
         let fh = self.next_fh;
         self.next_fh += 1;
-        let mut open_files_guard = self.open_files.lock().unwrap();
+        let mut open_files_guard = self.write_buffers.lock().unwrap();
 
-        open_files_guard.insert(fh, WriteState::Buffered(Vec::new()));
+        open_files_guard.insert(fh, Vec::new());
 
         let result = self.rt.block_on(async {
             self.s3
@@ -691,212 +678,41 @@ impl Filesystem for S3Fuse {
 
     // For the sake of simplicity, we are ignoring the write flags.
     // We are caching all writes by default in memory.
-    // For the sake of simplicity, we are ignoring the write flags.
-    // We are caching all writes by default in memory.
     fn write(
         &mut self,
         _req: &Request<'_>,
-        ino: u64,
+        _ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
-        reply: fuser::ReplyWrite,
+        reply: ReplyWrite,
     ) {
-        let path = match self.ino_to_path_cache.get(&ino) {
-            Some(p) => p.clone(),
+        let mut write_buffers_guard = self.write_buffers.lock().unwrap();
+
+        let buffer = match write_buffers_guard.get_mut(&fh) {
+            Some(buffer) => buffer,
             None => {
-                reply.error(libc::ENOENT);
+                reply.error(libc::EBADF);
                 return;
             }
         };
 
-        if (offset as u64 + data.len() as u64) > S3_MAX_SIZE {
+        let offset = offset as usize;
+        let write_end = offset + data.len();
+
+        if write_end as u64 > S3_MAX_SIZE {
             reply.error(libc::E2BIG);
             return;
         }
 
-        let mut open_files_guard = self.open_files.lock().unwrap();
-
-        if !open_files_guard.contains_key(&fh) {
-            reply.error(libc::EBADF);
-            return;
+        if write_end > buffer.len() {
+            buffer.resize(write_end, 0);
         }
 
-        // These variables will be populated inside the scoped borrow,
-        // and then used *after* the borrow is released.
-        let mut transition_to_mpu = false;
-        let mut part_upload_data: Vec<Vec<u8>> = Vec::new();
-
-        // Scope the mutable borrow tightly.
-        {
-            let state = open_files_guard.get_mut(&fh).unwrap(); // .unwrap() is safe due to check above.
-
-            match state {
-                WriteState::Buffered(buffer) => {
-                    let offset = offset as usize;
-                    let write_end = offset + data.len();
-                    if write_end > buffer.len() {
-                        buffer.resize(write_end, 0);
-                    }
-                    buffer[offset..write_end].copy_from_slice(data);
-
-                    if buffer.len() >= MULTIPART_THRESHOLD {
-                        transition_to_mpu = true;
-                    }
-                }
-                WriteState::Multipart {
-                    buffer,
-                    next_part_number,
-                    ..
-                } => {
-                    let current_uploaded_size = (*next_part_number - 1) as usize * MIN_PART_SIZE;
-
-                    // Check if the write is happening where we expect it, i.e. its a sequential write at the end of last full part.
-                    if offset as usize >= current_uploaded_size {
-                        let buffer_offset = offset as usize - current_uploaded_size;
-                        let write_end = buffer_offset + data.len();
-                        if write_end > buffer.len() {
-                            buffer.resize(write_end, 0);
-                        }
-                        buffer[buffer_offset..write_end].copy_from_slice(data);
-                    } else {
-                        // This is a seek to an earlier part of the file. We cannot support this in MPU
-                        // without non-trivial complexity.
-                        tracing::error!(
-                            "Seek detected in multipart file (writing at offset {}). This is not supported.",
-                            offset
-                        );
-                        reply.error(libc::ENOSYS);
-                        return;
-                    }
-
-                    while buffer.len() >= MIN_PART_SIZE {
-                        let chunk = buffer.drain(0..MIN_PART_SIZE).collect::<Vec<u8>>();
-                        part_upload_data.push(chunk);
-                    }
-                }
-            }
-        } // TODO: since we now use a Mutex, this code might be easy to simplify.
-
-        let s3_key = path_to_s3_key(&path);
-
-        // A. Handle the transition from Buffered to Multipart
-        if transition_to_mpu {
-            // We take the now-large buffer out of the `Buffered` state.
-            if let Some(WriteState::Buffered(buffered_data)) = open_files_guard.remove(&fh) {
-                tracing::info!("write: Transitioning file '{}' to multipart.", s3_key);
-
-                let mpu_resp = self.rt.block_on(
-                    self.s3
-                        .create_multipart_upload()
-                        .bucket(&self.bucket)
-                        .key(&s3_key)
-                        .send(),
-                );
-
-                let upload_id = match mpu_resp {
-                    Ok(resp) => resp.upload_id.unwrap_or_default(),
-                    Err(e) => {
-                        tracing::error!("Failed to create multipart upload: {}", e);
-                        reply.error(libc::EIO);
-                        return; // The file handle is already removed, so we can just exit.
-                    }
-                };
-
-                let mut completed_parts = Vec::new();
-                let mut next_part_number = 1;
-                let mut remaining_buffer = Vec::new();
-
-                // Upload the data we just took from the buffer as initial parts.
-                for chunk in buffered_data.chunks(MIN_PART_SIZE) {
-                    if chunk.len() < MIN_PART_SIZE {
-                        remaining_buffer.extend_from_slice(chunk);
-                        break;
-                    }
-                    match self.rt.block_on(self.upload_part(
-                        &upload_id,
-                        &s3_key,
-                        next_part_number,
-                        chunk.to_vec(),
-                    )) {
-                        Ok(part) => completed_parts.push(part),
-                        Err(e) => {
-                            tracing::error!("Failed to upload initial part: {}", e);
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                    }
-                    next_part_number += 1;
-                }
-
-                // Insert the new `Multipart` state back into the map for the file handle.
-                open_files_guard.insert(
-                    fh,
-                    WriteState::Multipart {
-                        upload_id,
-                        completed_parts,
-                        buffer: remaining_buffer,
-                        next_part_number,
-                    },
-                );
-            }
-        }
-
-        // Handle uploading new parts for an existing Multipart upload
-        if !part_upload_data.is_empty() {
-            // First, get the necessary info with a short-lived mutable borrow.
-            let (upload_id_clone, mut current_part_number) = {
-                // This scope limits the mutable borrow.
-                let state = open_files_guard.get_mut(&fh).unwrap();
-                if let WriteState::Multipart {
-                    upload_id,
-                    next_part_number,
-                    ..
-                } = state
-                {
-                    // Clone the ID and copy the part number. Now we have the data we need
-                    // without holding on to the borrow.
-                    (upload_id.clone(), *next_part_number)
-                } else {
-                    // This case should be impossible if the logic is correct, but we handle it.
-                    reply.error(libc::EIO);
-                    return;
-                }
-            };
-
-            // Now, perform the uploads. `self` is not mutably borrowed anymore.
-            let mut new_completed_parts = Vec::new();
-            for chunk in part_upload_data {
-                match self.rt.block_on(self.upload_part(
-                    &upload_id_clone,
-                    &s3_key,
-                    current_part_number,
-                    chunk,
-                )) {
-                    Ok(part) => new_completed_parts.push(part),
-                    Err(e) => {
-                        tracing::error!("Failed to upload part {}: {}", current_part_number, e);
-                        reply.error(libc::EIO);
-                        return;
-                    }
-                }
-                current_part_number += 1;
-            }
-
-            // Finally, re-borrow mutably to update the state with the results.
-            if let Some(WriteState::Multipart {
-                completed_parts,
-                next_part_number,
-                ..
-            }) = open_files_guard.get_mut(&fh)
-            {
-                completed_parts.extend(new_completed_parts);
-                *next_part_number = current_part_number;
-            }
-        }
+        buffer[offset..write_end].copy_from_slice(data);
 
         reply.written(data.len() as u32);
     }
@@ -911,11 +727,12 @@ impl Filesystem for S3Fuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let mut open_files_guard = self.open_files.lock().unwrap();
-        let state = match open_files_guard.remove(&fh) {
-            Some(state) => state,
+        let mut write_buffers_guard = self.write_buffers.lock().unwrap();
+        // Remove the buffer from the map. If it's not there, it was a read-only handle.
+        let buffer = match write_buffers_guard.remove(&fh) {
+            Some(buffer) => buffer,
             None => {
-                reply.error(libc::EBADF);
+                reply.ok();
                 return;
             }
         };
@@ -932,89 +749,146 @@ impl Filesystem for S3Fuse {
 
         let result: Result<(), Box<dyn std::error::Error + Send + Sync>> =
             self.rt.block_on(async {
-                match state {
-                    WriteState::Buffered(buffer) => {
-                        tracing::info!(
-                            "release: Uploading {} bytes to S3 key '{}' via PutObject",
-                            buffer.len(),
-                            s3_key
-                        );
+                if buffer.len() < MULTIPART_THRESHOLD {
+                    tracing::info!(
+                        "release: Uploading {} bytes to S3 key '{}' via PutObject",
+                        buffer.len(),
+                        s3_key
+                    );
 
-                        self.s3
-                            .put_object()
-                            .bucket(&self.bucket)
-                            .key(&s3_key)
-                            .body(ByteStream::from(buffer))
-                            .send()
-                            .await?;
+                    self.s3
+                        .put_object()
+                        .bucket(&self.bucket)
+                        .key(&s3_key)
+                        .body(ByteStream::from(buffer))
+                        .send()
+                        .await?;
+                } else {
+                    tracing::info!(
+                        "release: Uploading {} bytes to S3 key '{}' via Multipart Upload",
+                        buffer.len(),
+                        s3_key
+                    );
 
-                        Ok(())
-                    }
-                    WriteState::Multipart {
-                        buffer,
-                        mut completed_parts,
-                        upload_id,
-                        next_part_number,
-                    } => {
-                        let s3_key = path_to_s3_key(&path);
+                    let mpu = self
+                        .s3
+                        .create_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(&s3_key)
+                        .send()
+                        .await?;
 
-                        // 1. Upload any remaining data in the buffer as the last part.
-                        if !buffer.is_empty() {
-                            tracing::debug!(
-                                "release: Uploading final part of size {}",
-                                buffer.len()
-                            );
-                            // We can't use `?` here because we need to run abort on failure.
-                            match self
-                                .upload_part(&upload_id, &s3_key, next_part_number, buffer)
-                                .await
-                            {
-                                Ok(part) => completed_parts.push(part),
-                                Err(e) => {
-                                    // If the last part fails, we must abort the whole upload.
-                                    self.s3
-                                        .abort_multipart_upload()
-                                        .bucket(&self.bucket)
-                                        .key(&s3_key)
-                                        .upload_id(&upload_id)
-                                        .send()
-                                        .await?;
-                                    return Err(e.into());
-                                }
+                    let upload_id = mpu.upload_id.ok_or("S3 did not return an upload ID")?;
+
+                    let mut completed_parts = Vec::new();
+                    let mut part_number = 1;
+
+                    for chunk in buffer.chunks(MIN_PART_SIZE) {
+                        let part_data = chunk.to_vec();
+                        match self
+                            .upload_part(&upload_id, &s3_key, part_number, part_data)
+                            .await
+                        {
+                            Ok(part) => completed_parts.push(part),
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to upload part {}: {}. Aborting MPU.",
+                                    part_number,
+                                    e
+                                );
+                                self.s3
+                                    .abort_multipart_upload()
+                                    .bucket(&self.bucket)
+                                    .key(&s3_key)
+                                    .upload_id(&upload_id)
+                                    .send()
+                                    .await?;
+                                return Err(e.into());
                             }
                         }
-
-                        // Complete the multipart upload.
-                        tracing::info!("release: Completing multipart upload for key '{}'", s3_key);
-                        let mpu_parts = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-                            .set_parts(Some(completed_parts))
-                            .build();
-
-                        self.s3
-                            .complete_multipart_upload()
-                            .bucket(&self.bucket)
-                            .key(&s3_key)
-                            .upload_id(&upload_id)
-                            .multipart_upload(mpu_parts)
-                            .send()
-                            .await?;
-
-                        Ok(())
+                        part_number += 1;
                     }
+
+                    let mpu_parts = CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed_parts))
+                        .build();
+
+                    self.s3
+                        .complete_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(&s3_key)
+                        .upload_id(&upload_id)
+                        .multipart_upload(mpu_parts)
+                        .send()
+                        .await?;
                 }
+                Ok(())
             });
 
         match result {
             Ok(_) => {
-                tracing::info!("Successfully released and uploaded file.");
-                // TODO: Here you would update the parent directory's .dir_version
+                tracing::info!("Successfully released and uploaded file '{}'.", s3_key);
                 reply.ok();
             }
             Err(e) => {
-                tracing::error!("S3 operation failed on release: {}", e);
+                tracing::error!("S3 operation failed on release for key '{}': {}", s3_key, e);
                 reply.error(libc::EIO);
             }
         }
+    }
+
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        tracing::debug!("open(ino={}, flags={:#o})", ino, flags);
+
+        // `open` is for existing files, so the inode must be in our cache.
+        if !self.ino_to_path_cache.contains_key(&ino) {
+            reply.error(libc::ENOENT);
+            return;
+        }
+
+        let fh = self.next_fh;
+        self.next_fh += 1;
+
+        // O_ACCMODE is a mask for O_RDONLY, O_WRONLY, O_RDWR.
+        let access_mode = flags & libc::O_ACCMODE;
+
+        // If the file is opened for writing, we prepare a new write buffer.
+        // This effectively means any write-open will truncate the file on release,
+        // which is a simple and common strategy for object store filesystems.
+        if access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR {
+            let mut open_files = self.write_buffers.lock().unwrap();
+            open_files.insert(fh, Vec::new());
+            tracing::debug!(
+                "open: Opened file for writing. Assigned fh={}, created new write buffer.",
+                fh
+            );
+        } else {
+            // For read-only opens, we don't need a write state. `read` uses the inode.
+            tracing::debug!("open: Opened file for reading. Assigned fh={}.", fh);
+        }
+
+        // FOPEN_KEEP_CACHE tells the kernel it can cache the file's data.
+        reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        tracing::debug!("flush(ino={}, fh={})", ino, fh);
+        // In our design, all data is buffered until the final `release` call.
+        // `flush` (called on `close` and `fsync`) is therefore a no-op.
+        let open_files = self.write_buffers.lock().unwrap();
+        if open_files.contains_key(&fh) {
+            tracing::debug!("flush: fh {} has pending writes, deferring to release", fh);
+        } else {
+            tracing::debug!("flush: fh {} has no pending writes.", fh);
+        }
+        reply.ok();
     }
 }
 
