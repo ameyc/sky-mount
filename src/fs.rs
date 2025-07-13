@@ -2,13 +2,13 @@ use anyhow::Result;
 use aws_sdk_s3::{
     Client,
     error::SdkError,
-    operation::head_object::HeadObjectError,
+    operation::{head_object::HeadObjectError, put_object::PutObjectOutput},
     primitives::ByteStream,
-    types::{CompletedMultipartUpload, CompletedPart},
+    types::{CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier},
 };
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use std::{
     collections::HashMap,
@@ -21,26 +21,14 @@ use tokio::runtime::Runtime;
 
 use std::path::Path;
 
+use crate::utils;
+
 const TTL: Duration = Duration::from_secs(1);
 const S3_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024; // 5 TiB
 
 // Constants for Multipart Upload
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB: The minimum part size for S3 MPU
 const MULTIPART_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB: Files larger than this will use MPU
-
-/// Represents the state of a file being written.
-enum WriteState {
-    /// For small files, buffer the entire content in memory.
-    Buffered(Vec<u8>),
-    /// For large files, use S3's Multipart Upload.
-    Multipart {
-        upload_id: String,
-        completed_parts: Vec<CompletedPart>,
-        // A buffer for the current part being assembled.
-        buffer: Vec<u8>,
-        next_part_number: i32,
-    },
-}
 
 fn path_to_ino(path: &Path) -> u64 {
     // Inode 1 is special (root). We dont ever generate it.
@@ -71,49 +59,17 @@ const ROOT_ATTR: FileAttr = FileAttr {
     blksize: 0,
 };
 
-fn s3_meta_to_file_attr(
-    ino: u64,
-    key: &str,
-    meta: &aws_sdk_s3::operation::head_object::HeadObjectOutput,
-    uid: u32,
-    gid: u32,
-) -> FileAttr {
-    let kind = if key.ends_with('/') {
-        FileType::Directory
-    } else {
-        FileType::RegularFile
-    };
-    let perm = 0o755;
-    FileAttr {
-        ino,
-        size: meta.content_length.unwrap_or(0) as u64,
-        blocks: 0,
-        atime: meta
-            .last_modified()
-            .and_then(|dt| SystemTime::try_from(*dt).ok())
-            .unwrap_or(SystemTime::UNIX_EPOCH),
-        mtime: meta
-            .last_modified()
-            .and_then(|dt| SystemTime::try_from(*dt).ok())
-            .unwrap_or(SystemTime::UNIX_EPOCH),
-        ctime: SystemTime::UNIX_EPOCH,
-        crtime: SystemTime::UNIX_EPOCH,
-        kind,
-        perm,
-        nlink: 1,
-        uid: uid,
-        gid: gid,
-        rdev: 0,
-        flags: 0,
-        blksize: 512,
-    }
+#[derive(Clone)]
+struct InodeCacheEntry {
+    path: PathBuf,
+    kind: FileType,
 }
 
 pub struct S3Fuse {
     bucket: String,
     s3: Client,
     rt: Runtime,
-    ino_to_path_cache: HashMap<u64, PathBuf>,
+    ino_to_path_cache: HashMap<u64, InodeCacheEntry>,
     next_fh: u64,
     write_buffers: Mutex<HashMap<u64, Vec<u8>>>,
     mount_uid: u32,
@@ -136,7 +92,13 @@ impl S3Fuse {
             rt,
             ino_to_path_cache: {
                 let mut m = HashMap::new();
-                m.insert(1, PathBuf::from("/"));
+                m.insert(
+                    1,
+                    InodeCacheEntry {
+                        path: PathBuf::from("/"),
+                        kind: FileType::Directory,
+                    },
+                );
                 m
             },
             next_fh: 1,
@@ -170,6 +132,77 @@ impl S3Fuse {
             .part_number(part_number)
             .build())
     }
+
+    async fn do_rename_file(&self, old_key: &str, new_key: &str) -> Result<()> {
+        // 1. Copy the object to the new key. S3 metadata is preserved by default.
+        self.s3
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(format!("{}/{}", self.bucket, old_key))
+            .key(new_key)
+            .send()
+            .await?;
+
+        // 2. Delete the old object.
+        self.s3
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(old_key)
+            .send()
+            .await?;
+
+        Ok(())
+    }
+
+    /// NOTE: This operation is NOT ATOMIC.
+    async fn do_rename_dir(&self, old_prefix: &str, new_prefix: &str) -> Result<()> {
+        let mut objects_to_delete = Vec::new();
+
+        // 1. List all objects under the old prefix.
+        let mut stream = self
+            .s3
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(old_prefix)
+            .into_paginator()
+            .send();
+
+        while let Some(result) = stream.next().await {
+            let page = result?;
+            for object in page.contents.unwrap_or_default() {
+                if let Some(key) = object.key {
+                    // a. Copy each object to its new location
+                    let new_key = key.replacen(old_prefix, new_prefix, 1);
+                    self.s3
+                        .copy_object()
+                        .bucket(&self.bucket)
+                        .copy_source(format!("{}/{}", self.bucket, key))
+                        .key(new_key)
+                        .send()
+                        .await?;
+
+                    // b. Add the old key to a list for batch deletion
+                    objects_to_delete.push(ObjectIdentifier::builder().key(key).build()?);
+                }
+            }
+        }
+
+        // 2. Batch delete all the old objects.
+        if !objects_to_delete.is_empty() {
+            self.s3
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(
+                    Delete::builder()
+                        .set_objects(Some(objects_to_delete))
+                        .build()?,
+                )
+                .send()
+                .await?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Filesystem for S3Fuse {
@@ -198,22 +231,17 @@ impl Filesystem for S3Fuse {
 
     /// Look up a file or directory by name.
     fn lookup(&mut self, _req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEntry) {
-        // 1. Get the parent path from our cache.
         let parent_path = match self.ino_to_path_cache.get(&parent_ino) {
-            Some(p) => p,
+            Some(p) => &p.path,
             None => {
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        // 2. Construct the full path for the item we're looking up.
         let child_path = parent_path.join(name);
-        // S3 keys don't start with a '/', so we strip it.
-        let key = child_path.to_str().unwrap_or("").trim_start_matches('/');
-
+        let key = path_to_s3_key(&child_path);
         if key.is_empty() {
-            // Should only happen for lookup of "/" itself.
             let attr = FileAttr {
                 uid: self.mount_uid,
                 gid: self.mount_gid,
@@ -223,75 +251,95 @@ impl Filesystem for S3Fuse {
             return;
         }
 
-        tracing::debug!("lookup: trying key '{}'", key);
+        let dir_key = format!("{}/", key);
+        let ino = path_to_ino(&child_path);
 
-        // 3. Query S3 for the object's metadata.
-        let fut = self.s3.head_object().bucket(&self.bucket).key(key).send();
-        match self.rt.block_on(fut) {
-            Ok(meta) => {
-                // It's a file!
-                let ino = path_to_ino(&child_path);
-                let attr = s3_meta_to_file_attr(ino, key, &meta, self.mount_uid, self.mount_gid);
+        // 1. Check for explicit directory marker.
+        tracing::info!("checking for child_path={:?}", child_path);
+        if let Ok(dir_meta) = self.rt.block_on(
+            self.s3
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&dir_key)
+                .send(),
+        ) {
+            let attr = utils::s3_meta_to_file_attr(
+                ino,
+                &dir_key,
+                &dir_meta,
+                self.mount_uid,
+                self.mount_gid,
+            );
+            tracing::info!("child_path={:?} is a directory", child_path);
+            self.ino_to_path_cache.insert(
+                ino,
+                InodeCacheEntry {
+                    path: child_path,
+                    kind: FileType::Directory,
+                },
+            );
+            reply.entry(&TTL, &attr, 0);
+            return;
+        }
 
-                // Cache the new inode -> path mapping.
-                self.ino_to_path_cache.insert(ino, child_path);
+        // 2. Check for a file.
+        if let Ok(file_meta) = self
+            .rt
+            .block_on(self.s3.head_object().bucket(&self.bucket).key(&key).send())
+        {
+            let attr =
+                utils::s3_meta_to_file_attr(ino, &key, &file_meta, self.mount_uid, self.mount_gid);
+            tracing::info!("child_path={:?} is a file", child_path);
 
-                tracing::debug!("lookup: found file with attr {:?}", &attr);
-                reply.entry(&TTL, &attr, 0);
-            }
-            Err(SdkError::ServiceError(err))
-                if matches!(err.err(), HeadObjectError::NotFound(_)) =>
-            {
-                // Lets try key/ in case we hit an implicit directory.
-                let dir_key = format!("{}/", key);
-                tracing::debug!(
-                    "lookup: file not found, trying as directory with prefix '{}'",
-                    &dir_key
+            self.ino_to_path_cache.insert(
+                ino,
+                InodeCacheEntry {
+                    path: child_path,
+                    kind: FileType::RegularFile,
+                },
+            );
+            reply.entry(&TTL, &attr, 0);
+            return;
+        }
+
+        // 3. Check for an implicit directory.
+        if let Ok(list_output) = self.rt.block_on(
+            self.s3
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&dir_key)
+                .max_keys(1)
+                .send(),
+        ) {
+            tracing::info!(
+                "child_path={:?} appears to be an implicit directory",
+                child_path
+            );
+            if list_output.key_count.unwrap_or(0) > 0 {
+                let attr = FileAttr {
+                    ino,
+                    kind: FileType::Directory,
+                    perm: 0o755,
+                    nlink: 2,
+                    uid: self.mount_uid,
+                    gid: self.mount_gid,
+                    ..ROOT_ATTR
+                };
+                self.ino_to_path_cache.insert(
+                    ino,
+                    InodeCacheEntry {
+                        path: child_path,
+                        kind: FileType::Directory,
+                    },
                 );
-                let fut = self
-                    .s3
-                    .list_objects_v2()
-                    .bucket(&self.bucket)
-                    .prefix(&dir_key)
-                    .delimiter("/")
-                    .send();
-
-                match self.rt.block_on(fut) {
-                    Ok(list_output) => {
-                        if list_output.key_count.unwrap_or(0) > 0 {
-                            // It's a directory!
-                            let ino = path_to_ino(&child_path);
-                            let attr = FileAttr {
-                                ino,
-                                kind: FileType::Directory,
-                                perm: 0o755,
-                                uid: self.mount_uid,
-                                gid: self.mount_gid,
-                                ..ROOT_ATTR
-                            };
-                            self.ino_to_path_cache.insert(ino, child_path);
-                            tracing::debug!("lookup: found directory with attr {:?}", &attr);
-                            reply.entry(&TTL, &attr, 0);
-                        } else {
-                            // Doesn't exist as a file or a directory.
-                            tracing::debug!("lookup: path not found as file or directory");
-                            reply.error(libc::ENOENT);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("lookup: S3 list_objects_v2 error: {}", e);
-                        reply.error(libc::EIO);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::error!("lookup: S3 head_object error: {}", e);
-                reply.error(libc::EIO);
+                reply.entry(&TTL, &attr, 0);
+                return;
             }
         }
+
+        reply.error(libc::ENOENT);
     }
 
-    /// Get file attributes.
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if ino == 1 {
             let attr = FileAttr {
@@ -303,43 +351,55 @@ impl Filesystem for S3Fuse {
             return;
         }
 
-        // Find the path from the inode in our cache.
-        let path = match self.ino_to_path_cache.get(&ino).cloned() {
-            Some(p) => p,
+        // Get the path from our essential cache.
+        let cache_entry = match self.ino_to_path_cache.get(&ino).cloned() {
+            Some(p) => p.clone(),
             None => {
+                // This is a legitimate error. If the ino isn't in our cache, we can't know the path.
+                tracing::warn!("getattr: ino {} not found in cache.", ino);
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        let key = path.to_str().unwrap_or("").trim_start_matches('/');
-        tracing::debug!("getattr: ino {} -> key '{}'", ino, key);
+        // 2. Build the S3 key based on the cached 'kind'. NO GUESSWORK NEEDED.
+        let key = path_to_s3_key(&cache_entry.path);
+        let s3_key = if cache_entry.kind == FileType::Directory {
+            format!("{}/", key)
+        } else {
+            key
+        };
 
-        // Query S3 for fresh metadata.
-        let fut = self.s3.head_object().bucket(&self.bucket).key(key).send();
-        match self.rt.block_on(fut) {
+        tracing::debug!(
+            "getattr: looking for ino {} with known kind {:?} at key '{}'",
+            ino,
+            cache_entry.kind,
+            s3_key
+        );
+
+        // 3. Make ONE S3 API call to get fresh metadata.
+        let head_res = self.rt.block_on(
+            self.s3
+                .head_object()
+                .bucket(&self.bucket)
+                .key(&s3_key)
+                .send(),
+        );
+
+        match head_res {
             Ok(meta) => {
-                let attr = s3_meta_to_file_attr(ino, key, &meta, self.mount_uid, self.mount_gid);
+                let attr = utils::s3_meta_to_file_attr(
+                    ino,
+                    &s3_key,
+                    &meta,
+                    self.mount_uid,
+                    self.mount_gid,
+                );
                 reply.attr(&TTL, &attr);
             }
             Err(_) => {
-                // It might be a directory, which won't be found by HeadObject on the plain key.
-                // For simplicity, we return the directory defaults.
-                if self.ino_to_path_cache.get(&ino).map_or(false, |p| {
-                    p.is_dir() || p.to_str().unwrap_or("").ends_with('/')
-                }) {
-                    let attr = FileAttr {
-                        ino,
-                        kind: FileType::Directory,
-                        perm: 0o755,
-                        uid: self.mount_uid,
-                        gid: self.mount_gid,
-                        ..ROOT_ATTR
-                    };
-                    reply.attr(&TTL, &attr);
-                } else {
-                    reply.error(libc::ENOENT);
-                }
+                // The object might have been deleted since it was cached.
+                reply.error(libc::ENOENT);
             }
         }
     }
@@ -348,9 +408,9 @@ impl Filesystem for S3Fuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
         _mtime: Option<TimeOrNow>,
@@ -363,7 +423,7 @@ impl Filesystem for S3Fuse {
         reply: ReplyAttr,
     ) {
         let path = match self.ino_to_path_cache.get(&ino) {
-            Some(p) => p.clone(),
+            Some(p) => p.path.clone(),
             None => {
                 reply.error(libc::ENOENT);
                 return;
@@ -371,41 +431,84 @@ impl Filesystem for S3Fuse {
         };
         let key = path_to_s3_key(&path);
 
-        // Handle size changes (truncate) if requested
         if let Some(new_size) = size {
-            if new_size != 0 {
-                reply.error(libc::EOPNOTSUPP); // only support truncating to 0 for now
-                return;
-            }
-            // Put an empty object to truncate
-            if let Err(e) = self.rt.block_on(
-                self.s3
-                    .put_object()
-                    .bucket(&self.bucket)
-                    .key(&key)
-                    .body(aws_sdk_s3::primitives::ByteStream::from(Vec::new()))
-                    .send(),
-            ) {
-                tracing::error!("truncate failed: {}", e);
-                reply.error(libc::EIO);
+            if new_size == 0 {
+                // Truncate to 0 is a PutObject with an empty body
+                let res = self
+                    .rt
+                    .block_on(self.s3.put_object().bucket(&self.bucket).key(&key).send());
+                if res.is_err() {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            } else {
+                reply.error(libc::EOPNOTSUPP); // Truncating to non-zero is not supported
                 return;
             }
         }
 
-        let meta = self
+        // To change metadata, we must do a copy-in-place.
+        // First, get current metadata.
+        let head = match self
             .rt
             .block_on(self.s3.head_object().bucket(&self.bucket).key(&key).send())
-            .map_err(|_| ());
-
-        let attr = match meta {
-            Ok(m) => s3_meta_to_file_attr(ino, &key, &m, self.mount_uid, self.mount_gid),
+        {
+            Ok(h) => h,
             Err(_) => {
                 reply.error(libc::EIO);
                 return;
             }
         };
 
-        reply.attr(&TTL, &attr);
+        let mut current_attr =
+            utils::s3_meta_to_file_attr(ino, &key, &head, _req.uid(), _req.gid());
+        let mut needs_copy = false;
+
+        if let Some(new_mode) = mode {
+            current_attr.perm = new_mode as u16;
+            needs_copy = true;
+        }
+        if let Some(new_uid) = uid {
+            current_attr.uid = new_uid;
+            needs_copy = true;
+        }
+        if let Some(new_gid) = gid {
+            current_attr.gid = new_gid;
+            needs_copy = true;
+        }
+
+        if needs_copy {
+            let res = self.rt.block_on(
+                self.s3
+                    .copy_object()
+                    .bucket(&self.bucket)
+                    .copy_source(format!("{}/{}", self.bucket, key))
+                    .key(&key)
+                    .metadata_directive(MetadataDirective::Replace)
+                    .metadata("uid", current_attr.uid.to_string())
+                    .metadata("gid", current_attr.gid.to_string())
+                    .metadata("mode", current_attr.perm.to_string())
+                    .send(),
+            );
+
+            if res.is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        // After any operation, get the final state and reply.
+        match self
+            .rt
+            .block_on(self.s3.head_object().bucket(&self.bucket).key(&key).send())
+        {
+            Ok(meta) => {
+                let attr =
+                    utils::s3_meta_to_file_attr(ino, &key, &meta, self.mount_uid, self.mount_gid);
+                reply.attr(&TTL, &attr);
+            }
+            Err(_) => reply.error(libc::EIO),
+        }
     }
 
     fn readdir(
@@ -416,122 +519,100 @@ impl Filesystem for S3Fuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        // 1. Get the path for the directory from its inode.
-        // This part is critical. If the inode isn't in the cache, we MUST fail.
-        // The `ls` error suggests this check might be failing.
-        tracing::debug!("readdir called. {}", ino);
         let dir_path = match self.ino_to_path_cache.get(&ino) {
-            Some(p) => p.clone(),
+            Some(p) => p.path.clone(),
             None => {
-                tracing::info!("no inode found. returning");
                 reply.error(libc::ENOENT);
                 return;
             }
         };
 
-        // 2. Add the mandatory '.' and '..' entries FIRST.
-        // This is the most critical part to fix the `fts_read` error.
-        // We handle the offset to prevent adding them on subsequent readdir calls for the same dir.
         if offset == 0 {
-            // The first entry is '.', pointing to the directory itself.
             if reply.add(ino, 1, FileType::Directory, ".") {
                 reply.ok();
-                return; // Buffer is full, we're done.
+                return;
             }
-
-            // The second entry is '..', pointing to the parent.
-            // The parent of the root is the root itself.
+        }
+        if offset <= 1 {
             let parent_ino = dir_path.parent().map_or(1, |p| path_to_ino(p));
             if reply.add(parent_ino, 2, FileType::Directory, "..") {
                 reply.ok();
-                return; // Buffer is full.
+                return;
             }
         }
 
-        // A simple readdir implementation often re-fetches everything and just skips
-        // the entries that are before the requested offset.
-        let mut current_offset = 2i64; // Start after '.' and '..'
-
-        // 3. Convert the path to an S3 prefix.
-        let prefix = dir_path.to_str().unwrap_or("").trim_start_matches('/');
+        let mut current_offset = 2i64;
+        let prefix = path_to_s3_key(&dir_path);
         let prefix = if !prefix.is_empty() && !prefix.ends_with('/') {
             format!("{}/", prefix)
         } else {
-            prefix.to_string()
+            prefix
         };
 
-        tracing::debug!("readdir: listing objects with prefix '{}'", &prefix);
-
-        // 4. Call S3 and process the results.
-        let fut = self
+        // Use a paginator to handle directories with many items.
+        let mut paginator = self
             .s3
             .list_objects_v2()
             .bucket(&self.bucket)
             .prefix(prefix)
             .delimiter("/")
+            .into_paginator()
             .send();
 
-        match self.rt.block_on(fut) {
-            Ok(output) => {
-                // Process subdirectories
-                if let Some(common_prefixes) = output.common_prefixes {
-                    for cp in common_prefixes {
-                        current_offset += 1;
-                        if current_offset <= offset {
-                            continue;
-                        } // Skip entries before our offset
+        let mut entries_to_add: Vec<(u64, FileType, String)> = Vec::new();
 
-                        if let Some(dir_full_path) = cp.prefix() {
-                            let dir_name = Path::new(dir_full_path.trim_end_matches('/'))
-                                .file_name()
-                                .unwrap_or_default();
-                            let child_path = dir_path.join(dir_name);
-                            let child_ino = path_to_ino(&child_path);
-                            self.ino_to_path_cache.insert(child_ino, child_path);
-                            if reply.add(child_ino, current_offset, FileType::Directory, dir_name) {
-                                break; // Buffer is full
+        // Collect all possible entries first.
+        while let Some(result) = self.rt.block_on(paginator.next()) {
+            match result {
+                Ok(output) => {
+                    if let Some(prefixes) = output.common_prefixes {
+                        for p in prefixes {
+                            if let Some(dir_key) = p.prefix {
+                                let name = dir_key
+                                    .trim_end_matches('/')
+                                    .split('/')
+                                    .last()
+                                    .unwrap_or("")
+                                    .to_string();
+                                let ino = path_to_ino(&dir_path.join(&name));
+                                entries_to_add.push((ino, FileType::Directory, name));
+                            }
+                        }
+                    }
+                    if let Some(objects) = output.contents {
+                        for obj in objects {
+                            if let Some(key) = obj.key {
+                                if key.ends_with('/') {
+                                    continue;
+                                } // Skip directory markers
+                                let name = key.split('/').last().unwrap_or("").to_string();
+                                let ino = path_to_ino(&dir_path.join(&name));
+                                entries_to_add.push((ino, FileType::RegularFile, name));
                             }
                         }
                     }
                 }
-
-                // Process files
-                if let Some(contents) = output.contents {
-                    for object in contents {
-                        current_offset += 1;
-                        if current_offset <= offset {
-                            continue;
-                        } // Skip entries before our offset
-
-                        if let Some(key) = object.key() {
-                            if key.ends_with('/') {
-                                continue;
-                            }
-
-                            let file_name = Path::new(key).file_name().unwrap_or_default();
-                            let child_path = dir_path.join(file_name);
-                            let child_ino = path_to_ino(&child_path);
-                            self.ino_to_path_cache.insert(child_ino, child_path);
-
-                            if reply.add(
-                                child_ino,
-                                current_offset,
-                                FileType::RegularFile,
-                                file_name,
-                            ) {
-                                break; // Buffer is full
-                            }
-                        }
-                    }
+                Err(e) => {
+                    tracing::error!("readdir: S3 list_objects_v2 failed: {}", e);
+                    reply.error(libc::EIO);
+                    return;
                 }
-
-                reply.ok();
-            }
-            Err(e) => {
-                tracing::error!("readdir: S3 list_objects_v2 failed: {}", e);
-                reply.error(libc::EIO);
             }
         }
+
+        // Now, iterate through the collected entries and add them to the reply buffer,
+        // respecting the offset.
+        for (entry_ino, entry_type, entry_name) in entries_to_add {
+            current_offset += 1;
+            if current_offset - 1 <= offset {
+                continue;
+            }
+            if reply.add(entry_ino, current_offset - 1, entry_type, entry_name) {
+                break; // Buffer is full
+            }
+        }
+
+        reply.ok();
     }
 
     //TODO: support flags and lock_owners
@@ -547,7 +628,7 @@ impl Filesystem for S3Fuse {
         reply: fuser::ReplyData,
     ) {
         let path = match self.ino_to_path_cache.get(&ino) {
-            Some(p) => p.clone(),
+            Some(p) => p.path.clone(),
             None => {
                 tracing::info!("no inode found. returning");
                 reply.error(libc::ENOENT);
@@ -595,16 +676,16 @@ impl Filesystem for S3Fuse {
 
     fn create(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &std::ffi::OsStr,
         mode: u32,
         _umask: u32,
         _flags: i32,
-        reply: fuser::ReplyCreate,
+        reply: ReplyCreate,
     ) {
         let parent_path = match self.ino_to_path_cache.get(&parent) {
-            Some(p) => p.clone(),
+            Some(p) => p.path.clone(),
             None => {
                 reply.error(libc::ENOENT);
                 return;
@@ -617,20 +698,17 @@ impl Filesystem for S3Fuse {
 
         let fh = self.next_fh;
         self.next_fh += 1;
-        let mut open_files_guard = self.write_buffers.lock().unwrap();
+        self.write_buffers.lock().unwrap().insert(fh, Vec::new());
 
-        open_files_guard.insert(fh, Vec::new());
-
-        let result = self.rt.block_on(async {
+        let result: Result<PutObjectOutput, _> = self.rt.block_on(async {
             self.s3
                 .put_object()
                 .bucket(&self.bucket)
                 .key(&s3_key)
-                // Store permissions and ownership as S3 metadata tags.
-                .metadata("mode", mode.to_string())
-                .metadata("uid", _req.uid().to_string())
-                .metadata("gid", _req.gid().to_string())
-                .body(aws_sdk_s3::primitives::ByteStream::from(Vec::new())) // Empty body
+                .metadata("mode", (mode as u16).to_string()) // Store the requested mode
+                .metadata("uid", req.uid().to_string())
+                .metadata("gid", req.gid().to_string())
+                .body(ByteStream::from(Vec::new()))
                 .send()
                 .await
         });
@@ -639,8 +717,13 @@ impl Filesystem for S3Fuse {
             Ok(_) => {
                 let now = SystemTime::now();
                 let ino = path_to_ino(&new_file_path);
-
-                self.ino_to_path_cache.insert(ino, new_file_path);
+                self.ino_to_path_cache.insert(
+                    ino,
+                    InodeCacheEntry {
+                        path: new_file_path,
+                        kind: FileType::RegularFile,
+                    },
+                );
 
                 let attr = FileAttr {
                     ino,
@@ -653,24 +736,17 @@ impl Filesystem for S3Fuse {
                     kind: FileType::RegularFile,
                     perm: mode as u16,
                     nlink: 1,
-                    uid: _req.uid(),
-                    gid: _req.gid(),
+                    uid: req.uid(),
+                    gid: req.gid(),
                     rdev: 0,
                     flags: 0,
                     blksize: 512,
                 };
-
-                tracing::debug!(
-                    "create: Successfully created file. Replying with attr: {:?}",
-                    &attr
-                );
-
                 reply.created(&TTL, &attr, 0, fh, 0);
             }
             Err(e) => {
                 tracing::error!("create: S3 PutObject failed for key '{}': {}", s3_key, e);
-                // If the create fails, we must remove the buffer we allocated.
-                open_files_guard.remove(&fh);
+                self.write_buffers.lock().unwrap().remove(&fh);
                 reply.error(libc::EIO);
             }
         }
@@ -738,7 +814,7 @@ impl Filesystem for S3Fuse {
         };
 
         let path = match self.ino_to_path_cache.get(&ino) {
-            Some(p) => p.clone(),
+            Some(p) => p.path.clone(),
             None => {
                 reply.error(libc::ENOENT);
                 return;
@@ -837,37 +913,50 @@ impl Filesystem for S3Fuse {
         }
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+    fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         tracing::debug!("open(ino={}, flags={:#o})", ino, flags);
+        let path = match self.ino_to_path_cache.get(&ino) {
+            Some(p) => p.path.clone(),
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+        let key = path_to_s3_key(&path);
 
-        // `open` is for existing files, so the inode must be in our cache.
-        if !self.ino_to_path_cache.contains_key(&ino) {
-            reply.error(libc::ENOENT);
+        // Fetch attributes to check permissions
+        let head = match self
+            .rt
+            .block_on(self.s3.head_object().bucket(&self.bucket).key(&key).send())
+        {
+            Ok(h) => h,
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        };
+        let attr = utils::s3_meta_to_file_attr(ino, &key, &head, self.mount_uid, self.mount_gid);
+
+        // Check permissions based on open flags
+        let access_mask = match flags & libc::O_ACCMODE {
+            libc::O_RDONLY => 4, // Read
+            libc::O_WRONLY => 2, // Write
+            libc::O_RDWR => 6,   // Read-Write
+            _ => 0,
+        };
+
+        if access_mask > 0 && !utils::check_permission(&attr, req, access_mask) {
+            reply.error(libc::EACCES);
             return;
         }
 
         let fh = self.next_fh;
         self.next_fh += 1;
 
-        // O_ACCMODE is a mask for O_RDONLY, O_WRONLY, O_RDWR.
-        let access_mode = flags & libc::O_ACCMODE;
-
-        // If the file is opened for writing, we prepare a new write buffer.
-        // This effectively means any write-open will truncate the file on release,
-        // which is a simple and common strategy for object store filesystems.
-        if access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR {
-            let mut open_files = self.write_buffers.lock().unwrap();
-            open_files.insert(fh, Vec::new());
-            tracing::debug!(
-                "open: Opened file for writing. Assigned fh={}, created new write buffer.",
-                fh
-            );
-        } else {
-            // For read-only opens, we don't need a write state. `read` uses the inode.
-            tracing::debug!("open: Opened file for reading. Assigned fh={}.", fh);
+        if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
+            self.write_buffers.lock().unwrap().insert(fh, Vec::new());
         }
 
-        // FOPEN_KEEP_CACHE tells the kernel it can cache the file's data.
         reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
     }
 
@@ -889,6 +978,414 @@ impl Filesystem for S3Fuse {
             tracing::debug!("flush: fh {} has no pending writes.", fh);
         }
         reply.ok();
+    }
+
+    fn mkdir(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
+    ) {
+        tracing::debug!("mkdir(parent={}, name={:?}, mode={:o})", parent, name, mode);
+
+        // --- Permission Check (Corrected Pattern) ---
+        let parent_attr = if parent == 1 {
+            FileAttr {
+                uid: self.mount_uid,
+                gid: self.mount_gid,
+                ..ROOT_ATTR
+            }
+        } else {
+            let parent_path = match self.ino_to_path_cache.get(&parent) {
+                Some(p) => p.path.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            };
+            let parent_key = format!("{}/", path_to_s3_key(&parent_path));
+            let parent_head = match self.rt.block_on(
+                self.s3
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(&parent_key)
+                    .send(),
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
+            utils::s3_meta_to_file_attr(
+                parent,
+                &parent_key,
+                &parent_head,
+                self.mount_uid,
+                self.mount_gid,
+            )
+        };
+
+        if !utils::check_permission(&parent_attr, req, 2) {
+            // 2 = Write
+            reply.error(libc::EACCES);
+            return;
+        }
+        // --- End Permission Check ---
+
+        let parent_path = self.ino_to_path_cache.get(&parent).unwrap().path.clone(); // Safe now
+        let new_dir_path = parent_path.join(name);
+        let new_dir_key = format!("{}/", path_to_s3_key(&new_dir_path));
+
+        let result = self.rt.block_on(
+            self.s3
+                .put_object()
+                .bucket(&self.bucket)
+                .key(&new_dir_key)
+                .metadata("mode", (mode as u16).to_string())
+                .metadata("uid", req.uid().to_string())
+                .metadata("gid", req.gid().to_string())
+                .send(),
+        );
+
+        match result {
+            Ok(_) => {
+                let now = SystemTime::now();
+                let ino = path_to_ino(&new_dir_path);
+                self.ino_to_path_cache.insert(
+                    ino,
+                    InodeCacheEntry {
+                        path: new_dir_path,
+                        kind: FileType::Directory,
+                    },
+                );
+
+                let attr = FileAttr {
+                    ino,
+                    size: 0,
+                    blocks: 0,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                    crtime: now,
+                    kind: FileType::Directory,
+                    perm: mode as u16,
+                    nlink: 2,
+                    uid: req.uid(),
+                    gid: req.gid(),
+                    rdev: 0,
+                    flags: 0,
+                    blksize: 512,
+                };
+                reply.entry(&TTL, &attr, 0);
+            }
+            Err(e) => {
+                tracing::error!("mkdir failed: {}", e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        tracing::debug!("unlink(parent={}, name={:?})", parent, name);
+
+        //  Check
+        let parent_attr = if parent == 1 {
+            FileAttr {
+                uid: self.mount_uid,
+                gid: self.mount_gid,
+                ..ROOT_ATTR
+            }
+        } else {
+            let parent_path = match self.ino_to_path_cache.get(&parent) {
+                Some(p) => p.path.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            };
+            let parent_key = format!("{}/", path_to_s3_key(&parent_path));
+            let parent_head = match self.rt.block_on(
+                self.s3
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(&parent_key)
+                    .send(),
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
+            utils::s3_meta_to_file_attr(
+                parent,
+                &parent_key,
+                &parent_head,
+                self.mount_uid,
+                self.mount_gid,
+            )
+        };
+        if !utils::check_permission(&parent_attr, req, 2) {
+            // Write permission on parent
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        let parent_path = self.ino_to_path_cache.get(&parent).unwrap().path.clone();
+        let file_path = parent_path.join(name);
+        let file_key = path_to_s3_key(&file_path);
+
+        match self.rt.block_on(
+            self.s3
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&file_key)
+                .send(),
+        ) {
+            Ok(_) => {
+                let ino = path_to_ino(&file_path);
+                self.ino_to_path_cache.remove(&ino);
+                reply.ok();
+            }
+            Err(e) => {
+                tracing::error!("unlink failed: {}", e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        tracing::debug!("rmdir(parent={}, name={:?})", parent, name);
+
+        let parent_attr = if parent == 1 {
+            FileAttr {
+                uid: self.mount_uid,
+                gid: self.mount_gid,
+                ..ROOT_ATTR
+            }
+        } else {
+            let parent_path = match self.ino_to_path_cache.get(&parent) {
+                Some(p) => p.path.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            };
+            let parent_key = format!("{}/", path_to_s3_key(&parent_path));
+            let parent_head = match self.rt.block_on(
+                self.s3
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(&parent_key)
+                    .send(),
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
+            utils::s3_meta_to_file_attr(
+                parent,
+                &parent_key,
+                &parent_head,
+                self.mount_uid,
+                self.mount_gid,
+            )
+        };
+        if !utils::check_permission(&parent_attr, req, 2) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        let parent_path = self.ino_to_path_cache.get(&parent).unwrap().path.clone();
+        let dir_path = parent_path.join(name);
+        let dir_key = format!("{}/", path_to_s3_key(&dir_path));
+
+        let list_res = self.rt.block_on(
+            self.s3
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&dir_key)
+                .max_keys(2)
+                .send(),
+        );
+
+        match list_res {
+            Ok(output) => {
+                if output.key_count.unwrap_or(0) > 1 {
+                    reply.error(libc::ENOTEMPTY);
+                    return;
+                }
+                if let Some(contents) = output.contents {
+                    if !contents.is_empty() && contents[0].key() != Some(dir_key.as_str()) {
+                        reply.error(libc::ENOTEMPTY);
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("rmdir list check failed: {}", e);
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        match self.rt.block_on(
+            self.s3
+                .delete_object()
+                .bucket(&self.bucket)
+                .key(&dir_key)
+                .send(),
+        ) {
+            Ok(_) => {
+                let ino = path_to_ino(&dir_path);
+                self.ino_to_path_cache.remove(&ino);
+                reply.ok();
+            }
+            Err(e) => {
+                tracing::error!("rmdir deletion failed: {}", e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let old_parent_attr = if parent == 1 {
+            FileAttr {
+                uid: self.mount_uid,
+                gid: self.mount_gid,
+                ..ROOT_ATTR
+            }
+        } else {
+            let parent_path = match self.ino_to_path_cache.get(&parent) {
+                Some(p) => p.path.clone(),
+                None => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            };
+            let parent_key = format!("{}/", path_to_s3_key(&parent_path));
+            let parent_head = match self.rt.block_on(
+                self.s3
+                    .head_object()
+                    .bucket(&self.bucket)
+                    .key(&parent_key)
+                    .send(),
+            ) {
+                Ok(h) => h,
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
+            utils::s3_meta_to_file_attr(
+                parent,
+                &parent_key,
+                &parent_head,
+                self.mount_uid,
+                self.mount_gid,
+            )
+        };
+        if !utils::check_permission(&old_parent_attr, req, 2) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        if parent != newparent {
+            let new_parent_attr = if newparent == 1 {
+                FileAttr {
+                    uid: self.mount_uid,
+                    gid: self.mount_gid,
+                    ..ROOT_ATTR
+                }
+            } else {
+                let parent_path = match self.ino_to_path_cache.get(&newparent) {
+                    Some(p) => p.path.clone(),
+                    None => {
+                        reply.error(libc::ENOENT);
+                        return;
+                    }
+                };
+                let parent_key = format!("{}/", path_to_s3_key(&parent_path));
+                let parent_head = match self.rt.block_on(
+                    self.s3
+                        .head_object()
+                        .bucket(&self.bucket)
+                        .key(&parent_key)
+                        .send(),
+                ) {
+                    Ok(h) => h,
+                    Err(_) => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                };
+                utils::s3_meta_to_file_attr(
+                    newparent,
+                    &parent_key,
+                    &parent_head,
+                    self.mount_uid,
+                    self.mount_gid,
+                )
+            };
+            if !utils::check_permission(&new_parent_attr, req, 2) {
+                reply.error(libc::EACCES);
+                return;
+            }
+        }
+
+        let old_parent_cache_entry = self.ino_to_path_cache.get(&parent).unwrap().clone();
+        let new_parent_path_entry = self.ino_to_path_cache.get(&newparent).unwrap().clone();
+        let old_path = old_parent_cache_entry.path.join(name);
+        let old_ino = path_to_ino(&old_path);
+        let new_path = new_parent_path_entry.path.join(newname);
+        let new_ino = path_to_ino(&new_path);
+
+        let old_key = path_to_s3_key(&old_path);
+        let new_key = path_to_s3_key(&new_path);
+
+        let result = if old_parent_cache_entry.kind == FileType::Directory {
+            let old_dir_key = format!("{}/", old_key);
+            let new_dir_key = format!("{}/", new_key);
+            tracing::debug!("Renaming directory from {} to {}", old_dir_key, new_dir_key);
+            self.rt
+                .block_on(self.do_rename_dir(&old_dir_key, &new_dir_key))
+        } else {
+            tracing::debug!("Renaming file from {} to {}", old_key, new_key);
+            self.rt.block_on(self.do_rename_file(&old_key, &new_key))
+        };
+
+        match result {
+            Ok(_) => {
+                self.ino_to_path_cache.remove(&old_ino);
+                self.ino_to_path_cache.insert(
+                    new_ino,
+                    InodeCacheEntry {
+                        path: new_path,
+                        kind: old_parent_cache_entry.kind,
+                    },
+                );
+                reply.ok()
+            }
+            Err(e) => {
+                tracing::error!("rename failed: {}", e);
+                reply.error(libc::EIO)
+            }
+        }
     }
 }
 

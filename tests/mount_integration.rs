@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
-use tempfile::TempDir;
 
 /// A helper struct that manages the FUSE mount process.
 /// When it's created, it mounts the filesystem.
