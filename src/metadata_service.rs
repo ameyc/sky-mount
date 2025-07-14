@@ -182,6 +182,8 @@ impl MetadataService {
             "SELECT * FROM {} WHERE parent_ino = $1 AND name = $2",
             self.inodes_table_fqn
         );
+
+        tracing::debug!("lookup called for parent_ino={} name={}", parent_ino, name);
         sqlx::query(&sql)
             .bind(parent_ino as i64)
             .bind(name)

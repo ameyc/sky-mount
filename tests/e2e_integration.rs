@@ -151,7 +151,7 @@ fn filesystem_contract_tests() {
     test_scenario_deeply_nested(&base_path.join("nested"));
     test_scenario_special_chars(&base_path.join("special_chars"));
     test_scenario_large_file(&base_path.join("large_file"));
-    //test_scenario_concurrent_writes(&base_path.join("concurrent_writes"));
+    test_scenario_concurrent_writes(&base_path.join("concurrent_writes"));
     test_scenario_permission_denied(&base_path.join("perms_denied"));
 
     // --- 4. Automatic Teardown ---

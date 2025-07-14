@@ -126,7 +126,7 @@ impl Filesystem for S3Fuse {
             None => return reply.error(libc::EINVAL),
         };
 
-        // 1. Look up in metadata service.
+        // Look up in metadata service.
         if let Ok(Some(inode)) = self
             .rt
             .block_on(self.metadata_service.lookup(parent_ino, name_str))
@@ -134,7 +134,7 @@ impl Filesystem for S3Fuse {
             return reply.entry(&TTL, &inode.to_file_attr(), 0);
         }
 
-        // 2. If not found, check S3 for lazy indexing.
+        // If not found, check S3 for lazy indexing.
         let parent_inode = match self
             .rt
             .block_on(self.metadata_service.get_inode(parent_ino))
@@ -764,7 +764,15 @@ impl Filesystem for S3Fuse {
     ) {
         let name_str = name.to_str().unwrap();
         let newname_str = newname.to_str().unwrap();
+        tracing::info!(
+            "rename: parent={}, name='{}', newparent={}, newname='{}'",
+            parent,
+            name_str,
+            newparent,
+            newname_str
+        );
 
+        // Permission Checks
         let old_parent_inode = match self.rt.block_on(self.metadata_service.get_inode(parent)) {
             Ok(Some(i)) => i,
             _ => return reply.error(libc::ENOENT),
@@ -783,20 +791,88 @@ impl Filesystem for S3Fuse {
             }
         }
 
+        // Find the source inode, with fallback for macOS rename patterns
         let source_inode = match self
             .rt
             .block_on(self.metadata_service.lookup(parent, name_str))
         {
-            Ok(Some(i)) => i,
-            _ => return reply.error(libc::ENOENT),
+            Ok(Some(inode)) => inode, // Happy path: Found the inode directly.
+            Ok(None) => {
+                // Fallback: The exact name was not found. This can happen during
+                // atomic save operations. Let's see if we can infer the source.
+                tracing::warn!(
+                    "rename: Initial lookup for '{}' in parent ino {} failed. Attempting fallback.",
+                    name_str,
+                    parent
+                );
+                let children = match self
+                    .rt
+                    .block_on(self.metadata_service.list_directory(parent))
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(
+                            "rename fallback: Failed to list parent dir {}: {}",
+                            parent,
+                            e
+                        );
+                        return reply.error(libc::EIO);
+                    }
+                };
+
+                // Heuristic: If there is exactly one regular file in the directory,
+                // assume that's the one the OS wants to rename.
+                let files: Vec<_> = children
+                    .into_iter()
+                    .filter(|e| e.kind == FileType::RegularFile)
+                    .collect();
+
+                if files.len() == 1 {
+                    let assumed_name = &files[0].name;
+                    tracing::warn!(
+                        "rename fallback: Assuming target is the single file in the directory: '{}'",
+                        assumed_name
+                    );
+                    // Re-lookup with the inferred name to get the full inode.
+                    match self
+                        .rt
+                        .block_on(self.metadata_service.lookup(parent, assumed_name))
+                    {
+                        Ok(Some(inode)) => inode,
+                        _ => {
+                            tracing::error!(
+                                "rename fallback: Could not re-lookup assumed file '{}'",
+                                assumed_name
+                            );
+                            return reply.error(libc::ENOENT);
+                        }
+                    }
+                } else {
+                    tracing::error!(
+                        "rename fallback: Found {} files, cannot guess target. Aborting.",
+                        files.len()
+                    );
+                    return reply.error(libc::ENOENT);
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    "rename: DB error during initial lookup for '{}': {}",
+                    name_str,
+                    e
+                );
+                return reply.error(libc::EIO);
+            }
         };
 
+        // Perform S3 and DB Rename
         let old_key_base = self.get_s3_key_from_inode(&source_inode);
         let new_parent_inode = self
             .rt
             .block_on(self.metadata_service.get_inode(newparent))
             .unwrap()
             .unwrap();
+
         let new_parent_path_base = self.get_s3_key_from_inode(&new_parent_inode);
         let new_key_base = PathBuf::from(new_parent_path_base)
             .join(newname)
@@ -813,14 +889,23 @@ impl Filesystem for S3Fuse {
             self.rt
                 .block_on(self.object_store.rename_file(&old_key_base, &new_key_base))
         };
+
         if let Err(e) = s3_rename_result {
-            tracing::error!(
-                "S3 rename from '{}' to '{}' failed: {}",
-                old_key_base,
-                new_key_base,
-                e
-            );
-            return reply.error(libc::EIO);
+            // This inner fallback for ._* files is still valuable.
+            if name_str.starts_with("._") && e.to_string().contains("NoSuchKey") {
+                tracing::warn!(
+                    "Ignoring S3 NoSuchKey for temp file rename: {}. Assuming OS-led swap.",
+                    old_key_base
+                );
+            } else {
+                tracing::error!(
+                    "S3 rename from '{}' to '{}' failed: {}",
+                    old_key_base,
+                    new_key_base,
+                    e
+                );
+                return reply.error(libc::EIO);
+            }
         }
 
         match self.rt.block_on(self.metadata_service.rename_inode(
@@ -831,9 +916,10 @@ impl Filesystem for S3Fuse {
             Ok(_) => reply.ok(),
             Err(e) => {
                 tracing::error!(
-                    "DB rename for ino {} to new parent {} failed: {}",
+                    "DB rename for ino {} to new parent {} with name '{}' failed: {}",
                     source_inode.ino,
                     newparent,
+                    newname_str,
                     e
                 );
                 reply.error(libc::EIO);
