@@ -17,6 +17,9 @@ struct CliArgs {
     /// The S3 bucket name to mount.
     bucket_name: String,
 
+    /// Postgres connection url
+    db_url: String,
+
     /// The local directory path to mount the filesystem on.
     mount_point: PathBuf,
 
@@ -45,7 +48,7 @@ fn main() -> Result<()> {
         options.push(MountOption::RO);
     }
 
-    let s3_filesystem = S3Fuse::new(args.bucket_name)?;
+    let s3_filesystem = S3Fuse::new(args.bucket_name, &args.db_url)?;
     let mount_point = args.mount_point.as_path();
 
     // 1. Create the session and spawn it in the background.

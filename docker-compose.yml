@@ -1,5 +1,4 @@
-# docker-compose.yml
-version: '3.8'
+
 services:
   minio:
     image: minio/minio:latest
@@ -7,6 +6,26 @@ services:
       - "9000:9000"
       - "9001:9001"
     environment:
-      - MINIO_ROOT_USER=minioadmin
-      - MINIO_ROOT_PASSWORD=minioadmin
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
     command: server /data --console-address ":9001"
+  
+  pg_meta:
+    image: postgres:16
+    container_name: pg_meta
+    environment:
+      POSTGRES_USER: fsuser
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: fsmeta
+      # required so Postgres starts with ltree already available
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "fsuser"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      # create‑extension script is executed automatically on first boot
+      - ./initdb:/docker-entrypoint-initdb.d:ro
