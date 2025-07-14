@@ -1,0 +1,420 @@
+use crate::error::FsError;
+use aws_sdk_s3::{
+    Client,
+    operation::head_object::HeadObjectOutput,
+    primitives::ByteStream,
+    types::{CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier},
+};
+use fuser::FileType;
+use std::path::Path;
+
+// Constants for Multipart Upload
+const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
+const MULTIPART_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB
+
+pub struct ObjectStore {
+    pub s3: Client,
+    pub bucket: String,
+}
+
+#[derive(Debug)]
+pub struct DirectoryEntry {
+    /// The simple name of the file or subdirectory (e.g., "file.txt", "subdir")
+    pub name: String,
+    /// The type of the entry (RegularFile or Directory)
+    pub kind: FileType,
+}
+
+#[derive(Debug)]
+pub enum ObjectKind {
+    File(HeadObjectOutput),
+    Directory(Option<HeadObjectOutput>), // Implcit dirs that have no HeadObject from s3. so option will be None
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ObjectUserMetadata {
+    pub mode: Option<u16>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+}
+
+// NOTE: This can be made a generic non-S3 specific trait to be implemented for various clients.
+impl ObjectStore {
+    pub async fn new(bucket: String) -> Result<Self, FsError> {
+        let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let s3 = Client::new(&conf);
+
+        s3.head_bucket().bucket(&bucket).send().await.map_err(|e| {
+            eprintln!("Failed to connect to bucket '{}': {}", bucket, e);
+            FsError::S3(format!("Bucket '{}' not found or no permissions", bucket))
+        })?;
+
+        Ok(Self { s3, bucket })
+    }
+}
+
+impl ObjectStore {
+    pub async fn list_directory(&self, prefix: &str) -> Result<Vec<DirectoryEntry>, FsError> {
+        let mut entries = Vec::new();
+        let mut stream = self
+            .s3
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .delimiter("/") // The key to a shallow, directory-like list
+            .into_paginator()
+            .send();
+
+        while let Some(result) = stream.next().await {
+            let page = result?;
+
+            // Process common prefixes, which represent subdirectories
+            if let Some(common_prefixes) = page.common_prefixes {
+                for p in common_prefixes {
+                    if let Some(dir_key) = p.prefix {
+                        // Extract the simple name from the prefix
+                        // e.g., "path/to/subdir/" -> "subdir"
+                        let name = dir_key
+                            .trim_end_matches('/')
+                            .split('/')
+                            .last()
+                            .unwrap_or("")
+                            .to_string();
+
+                        if !name.is_empty() {
+                            entries.push(DirectoryEntry {
+                                name,
+                                kind: FileType::Directory,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Process objects, which represent files
+            if let Some(objects) = page.contents {
+                for obj in objects {
+                    if let Some(key) = obj.key {
+                        // Skip the directory marker object itself
+                        if key == prefix {
+                            continue;
+                        }
+                        // Extract the simple name from the key
+                        // e.g., "path/to/file.txt" -> "file.txt"
+                        let name = key.split('/').last().unwrap_or("").to_string();
+
+                        if !name.is_empty() {
+                            entries.push(DirectoryEntry {
+                                name,
+                                kind: FileType::RegularFile,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Uploads a block of data to S3, automatically choosing between
+    /// a single PutObject and a Multipart Upload based on size.
+    pub async fn upload(&self, key: &str, data: Vec<u8>) -> Result<(), FsError> {
+        if data.len() < MULTIPART_THRESHOLD {
+            // Use simple PutObject for smaller files
+            self.s3
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(data))
+                .send()
+                .await?;
+        } else {
+            // Use Multipart Upload for larger files
+            tracing::info!(
+                "upload for {} ({} bytes) is over the MULTIPART_THREADHOLD={}. Switching to multipart uploads",
+                key,
+                data.len(),
+                MULTIPART_THRESHOLD
+            );
+            self.upload_multipart(key, data).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Downloads a specific byte range from an S3 object.
+    pub async fn download_range(
+        &self,
+        key: &str,
+        start: u64,
+        size: u32,
+    ) -> Result<ByteStream, FsError> {
+        let end = start + (size as u64) - 1;
+        let range_str = format!("bytes={}-{}", start, end);
+
+        let output = self
+            .s3
+            .get_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .range(range_str)
+            .send()
+            .await?;
+        Ok(output.body)
+    }
+
+    /// Creates a new, zero-byte object and sets its initial metadata.
+    /// This is the semantically correct method for `create`.
+    pub async fn create_object(
+        &self,
+        key: &str,
+        metadata: &ObjectUserMetadata,
+    ) -> Result<(), FsError> {
+        // Step 1: Create a zero-byte placeholder object. This is an atomic Put.
+        // We don't add metadata here to avoid duplicating the logic.
+        self.s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(Vec::new()))
+            .send()
+            .await?;
+
+        self.replace_metadata(key, metadata).await?;
+
+        Ok(())
+    }
+
+    /// Deletes a single object from S3.
+    pub async fn delete_object(&self, key: &str) -> Result<(), FsError> {
+        self.s3
+            .delete_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_attributes(&self, key: &str) -> Result<HeadObjectOutput, FsError> {
+        let meta = self
+            .s3
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|_| FsError::NotFound)?; // Treat any HeadObject error as "not found"
+        Ok(meta)
+    }
+
+    pub async fn truncate_file(&self, key: &str) -> Result<(), FsError> {
+        self.s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(Vec::new()))
+            .send()
+            .await?;
+        Ok(())
+    }
+
+    /// Replaces the metadata on an object by performing a copy-in-place.
+    /// S3 requires that *all* metadata be replaced, so this method takes
+    /// the full desired set.
+    pub async fn replace_metadata(
+        &self,
+        key: &str,
+        metadata: &ObjectUserMetadata,
+    ) -> Result<(), FsError> {
+        let copy_source = format!("{}/{}", self.bucket, key);
+        let mut request = self
+            .s3
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(copy_source)
+            .key(key)
+            .metadata_directive(MetadataDirective::Replace);
+
+        // Add the metadata fields if they are present
+        if let Some(mode) = metadata.mode {
+            request = request.metadata("mode", mode.to_string());
+        }
+        if let Some(uid) = metadata.uid {
+            request = request.metadata("uid", uid.to_string());
+        }
+        if let Some(gid) = metadata.gid {
+            request = request.metadata("gid", gid.to_string());
+        }
+
+        request.send().await?;
+        Ok(())
+    }
+
+    /// Determines if a path corresponds to a file or a directory (explicit or implicit).
+    pub async fn stat_object(&self, key: &str) -> Result<ObjectKind, FsError> {
+        // Check for an explicit directory marker first.
+        let dir_key = format!("{}/", key);
+        if let Ok(meta) = self.get_attributes(&dir_key).await {
+            return Ok(ObjectKind::Directory(Some(meta)));
+        }
+
+        // Check for a file.
+        if let Ok(meta) = self.get_attributes(key).await {
+            return Ok(ObjectKind::File(meta));
+        }
+
+        // Check for an implicit directory by listing its contents.
+        let entries = self.list_directory(&dir_key).await?;
+        if !entries.is_empty() {
+            return Ok(ObjectKind::Directory(None));
+        }
+
+        // If all checks fail, it doesn't exist.
+        Err(FsError::NotFound)
+    }
+
+    /// Renames a file by copying it to a new key and deleting the old one.
+    /// NOTE: This is NOT ATOMIC.
+    pub async fn rename_file(&self, old_key: &str, new_key: &str) -> Result<(), FsError> {
+        let copy_source = format!("{}/{}", self.bucket, old_key);
+        self.s3
+            .copy_object()
+            .bucket(&self.bucket)
+            .copy_source(copy_source)
+            .key(new_key)
+            .send()
+            .await?;
+
+        self.delete_object(old_key).await?;
+        Ok(())
+    }
+
+    /// Renames a "directory" by listing, copying, and deleting all objects under a prefix.
+    /// NOTE: This is NOT ATOMIC and can be very slow for large directories.
+    pub async fn rename_dir(&self, old_prefix: &str, new_prefix: &str) -> Result<(), FsError> {
+        let mut objects_to_delete = Vec::new();
+        let mut stream = self
+            .s3
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(old_prefix)
+            .into_paginator()
+            .send();
+
+        while let Some(result) = stream.next().await {
+            let page = result?;
+            for object in page.contents.unwrap_or_default() {
+                if let Some(key) = object.key {
+                    let new_key = key.replacen(old_prefix, new_prefix, 1);
+                    let copy_source = format!("{}/{}", self.bucket, key);
+                    self.s3
+                        .copy_object()
+                        .bucket(&self.bucket)
+                        .copy_source(copy_source)
+                        .key(new_key)
+                        .send()
+                        .await?;
+
+                    objects_to_delete.push(ObjectIdentifier::builder().key(key).build()?);
+                }
+            }
+        }
+
+        if !objects_to_delete.is_empty() {
+            self.s3
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(
+                    Delete::builder()
+                        .set_objects(Some(objects_to_delete))
+                        .build()?,
+                )
+                .send()
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn upload_multipart(&self, key: &str, data: Vec<u8>) -> Result<(), FsError> {
+        let mpu = self
+            .s3
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+
+        let upload_id = mpu
+            .upload_id
+            .ok_or_else(|| FsError::S3("S3 did not return an upload ID".into()))?;
+
+        let mut completed_parts = Vec::new();
+        let mut part_number = 1;
+
+        for chunk in data.chunks(MIN_PART_SIZE) {
+            match self
+                .upload_part(&upload_id, key, part_number, chunk.to_vec())
+                .await
+            {
+                Ok(part) => completed_parts.push(part),
+                Err(e) => {
+                    tracing::error!(
+                        "Aborting multipart upload for {} upload_id={}. {}",
+                        key,
+                        upload_id,
+                        e
+                    );
+                    self.s3
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await?;
+                    return Err(e);
+                }
+            }
+            part_number += 1;
+        }
+
+        let mpu_parts = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+        self.s3
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(mpu_parts)
+            .send()
+            .await?;
+        tracing::debug!("successfully uploaded {} parts for {}", part_number, key);
+        Ok(())
+    }
+
+    async fn upload_part(
+        &self,
+        upload_id: &str,
+        key: &str,
+        part_number: i32,
+        data: Vec<u8>,
+    ) -> Result<CompletedPart, FsError> {
+        let stream = ByteStream::from(data);
+        let part_resp = self
+            .s3
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(stream)
+            .send()
+            .await?;
+
+        Ok(CompletedPart::builder()
+            .e_tag(part_resp.e_tag.unwrap_or_default())
+            .part_number(part_number)
+            .build())
+    }
+}
