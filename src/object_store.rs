@@ -6,7 +6,6 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier},
 };
 use fuser::FileType;
-use std::path::Path;
 
 // Constants for Multipart Upload
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB

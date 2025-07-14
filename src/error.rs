@@ -9,12 +9,8 @@ pub enum FsError {
     #[error("S3 API error: {0}")]
     S3(String),
 
-    #[error("Operation is not supported")]
-    NotSupported,
-
     #[error("Entity not found")]
     NotFound,
-    // ... add other specific errors like AccessDenied as needed
 }
 
 // A helper to convert generic S3 SDK errors into our FsError::S3 type
