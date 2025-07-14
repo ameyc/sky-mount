@@ -2,6 +2,9 @@ use std::{collections::HashMap, time::SystemTime};
 
 use fuser::{FileAttr, FileType, Request};
 
+const DEFAULT_FILE_MODE: u16 = 0o644;
+const DEFAULT_DIR_MODE: u16 = 0o755;
+
 pub fn s3_meta_to_file_attr(
     ino: u64,
     key: &str,
@@ -9,18 +12,29 @@ pub fn s3_meta_to_file_attr(
     default_uid: u32,
     default_gid: u32,
 ) -> FileAttr {
-    let kind = if key.ends_with('/') {
-        FileType::Directory
+    let (kind, default_perm) = if key.ends_with('/') {
+        (FileType::Directory, DEFAULT_DIR_MODE)
     } else {
-        FileType::RegularFile
+        (FileType::RegularFile, DEFAULT_FILE_MODE)
     };
 
     let empty_map = HashMap::new();
     let s3_meta = meta.metadata().unwrap_or(&empty_map);
-    let perm = s3_meta
-        .get("mode")
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0o644); // Default to rw-r--r--
+
+    let perm = match s3_meta.get("mode") {
+        Some(s) => match u16::from_str_radix(s.trim_start_matches("0o"), 8) {
+            Ok(m) => {
+                tracing::debug!("mode for {} parsed out as {}", key, m);
+                m
+            }
+            Err(e) => {
+                tracing::warn!("invalid mode metadata `{}`: {}", s, e);
+                default_perm
+            }
+        },
+        None => default_perm,
+    };
+
     let uid = s3_meta
         .get("uid")
         .and_then(|s| s.parse::<u32>().ok())
@@ -29,6 +43,8 @@ pub fn s3_meta_to_file_attr(
         .get("gid")
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(default_gid);
+
+    let nlink = if kind == FileType::Directory { 2 } else { 1 };
 
     FileAttr {
         ino,
@@ -46,7 +62,7 @@ pub fn s3_meta_to_file_attr(
         crtime: SystemTime::UNIX_EPOCH,
         kind,
         perm,
-        nlink: 1,
+        nlink,
         uid,
         gid,
         rdev: 0,

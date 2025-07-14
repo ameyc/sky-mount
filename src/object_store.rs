@@ -237,7 +237,9 @@ impl ObjectStore {
 
         // Add the metadata fields if they are present
         if let Some(mode) = metadata.mode {
-            request = request.metadata("mode", mode.to_string());
+            // FORMAT the integer as an octal string before storing.
+            let octal_mode = format!("{:o}", mode);
+            request = request.metadata("mode", octal_mode);
         }
         if let Some(uid) = metadata.uid {
             request = request.metadata("uid", uid.to_string());

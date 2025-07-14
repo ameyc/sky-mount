@@ -1,4 +1,4 @@
-mod error;
+pub mod error;
 pub mod fs;
-mod object_store;
+pub mod object_store;
 mod utils;

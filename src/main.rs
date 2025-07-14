@@ -30,8 +30,6 @@ struct CliArgs {
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
-    tracing::info!("Launching Sky Mount");
-
     let args = CliArgs::parse();
     tracing::info!(
         "Mounting bucket '{}' on '{}'",
