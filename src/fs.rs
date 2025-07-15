@@ -1,6 +1,6 @@
 use anyhow::Result;
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use std::{
@@ -17,7 +17,7 @@ use std::path::Path;
 
 use crate::{
     metadata_service::{Inode, MetadataService},
-    object_store::{ObjectKind, ObjectStore, ObjectUserMetadata},
+    object_store::{ObjectStore, ObjectUserMetadata},
     utils,
 };
 
@@ -32,26 +32,6 @@ fn path_to_ino(path: &Path) -> u64 {
     } else {
         // Ensure that the generated hash is greater than 1
         seahash::hash(path.as_os_str().as_encoded_bytes()) + 2
-    }
-}
-
-fn default_root_attr() -> FileAttr {
-    FileAttr {
-        ino: 1,
-        size: 0,
-        blocks: 0,
-        atime: std::time::UNIX_EPOCH,
-        mtime: std::time::UNIX_EPOCH,
-        ctime: std::time::UNIX_EPOCH,
-        crtime: std::time::UNIX_EPOCH,
-        kind: fuser::FileType::Directory,
-        perm: 0o755,
-        nlink: 2,
-        uid: 0,
-        gid: 0,
-        rdev: 0,
-        flags: 0,
-        blksize: 0,
     }
 }
 
@@ -120,7 +100,7 @@ impl Filesystem for S3Fuse {
         Ok(())
     }
 
-    fn lookup(&mut self, req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, _req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s,
             None => {

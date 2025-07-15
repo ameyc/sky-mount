@@ -8,8 +8,6 @@ use sqlx::{
 };
 use time::OffsetDateTime;
 
-// --- Inode Struct and Helpers ---
-
 #[derive(Debug, Clone)]
 pub struct Inode {
     pub ino: i64,
@@ -216,34 +214,34 @@ impl MetadataService {
         if let Some(s) = size {
             let idx = args.len() + 1;
             set_clauses.push(format!("size = ${}", idx));
-            args.add(s);
+            let _ = args.add(s);
         }
         if let Some(p) = perm {
             let idx = args.len() + 1;
             set_clauses.push(format!("perm = ${}", idx));
-            args.add(p);
+            let _ = args.add(p);
         }
         if let Some(u) = uid {
             let idx = args.len() + 1;
             set_clauses.push(format!("uid = ${}", idx));
-            args.add(u);
+            let _ = args.add(u);
         }
         if let Some(g) = gid {
             let idx = args.len() + 1;
             set_clauses.push(format!("gid = ${}", idx));
-            args.add(g);
+            let _ = args.add(g);
         }
         if let Some(a) = atime {
             let idx = args.len() + 1;
             set_clauses.push(format!("atime = ${}", idx));
-            args.add(a);
+            let _ = args.add(a);
         }
         if let Some(m) = mtime {
             let idx = args.len() + 1;
             // use same placeholder for both mtime and ctime
             set_clauses.push(format!("mtime = ${}", idx));
             set_clauses.push(format!("ctime = ${}", idx));
-            args.add(m);
+            let _ = args.add(m);
         }
 
         // No changes requested? Just re-fetch the row.
