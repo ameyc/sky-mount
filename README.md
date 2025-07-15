@@ -85,7 +85,7 @@ The `docker-compose.yml` file is provided to spin up a local S3-compatible servi
 
 1.  **Start the Test Environment:**
     ```bash
-    docker-compose up -d
+    docker compose up -d
     ```
 2.  **Run the Tests:**
     ```bash
@@ -124,7 +124,7 @@ This quick‑start section walks you through mounting the filesystem on macOS.  
 
 ```bash
 # From the repo root
-$ docker-compose up -d postgres
+$ docker compose up -d postgres
 ```
 
 This spins up a single‑node Postgres instance whose credentials match the values hard‑coded in `mount.sh` (`fsuser/secret` → DB `fsmeta`).
