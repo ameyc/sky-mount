@@ -101,37 +101,101 @@ cargo build --release
 ```
 The compiled binary will be located at `./target/release/sky-mount`.
 
-### Mounting the Filesystem
+## Mounting Sky‑Mount S3 Filesystem
 
-1.  **Create a Mount Point:** This is an empty directory on your local machine.
-    ```bash
-    mkdir ~/s3-drive
-    ```
+This quick‑start section walks you through mounting the filesystem on macOS.  It assumes you have already cloned the repo and have a working `mount.sh` script (see [`scripts/mount.sh`](scripts/mount.sh)).
 
-2.  **Run the Mount Command:**
-    Use the binary you just built, providing your S3 bucket name and the path to your mount point.
-    ```bash
-    # Syntax: ./target/release/sky-mount <bucket-name> <mount-point>
-    ./target/release/sky-mount my-cloud-storage-bucket ~/s3-drive
-    ```
+---
 
-3.  The filesystem is now mounted. You can use any standard command-line tools to interact with it.
-    ```bash
-    # List contents
-    ls -la ~/s3-drive
+### 1  Prerequisites
 
-    # Create a file
-    echo "Hello from Sky-Mount!" > ~/s3-drive/hello.txt
+| Tool                            | Why you need it                                                | Install hint                                                                                                      |
+| ------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| **MacFUSE 4.6+**                | Kernel extension that lets user‑space filesystems mount safely | Download DMG from [https://osxfuse.github.io](https://osxfuse.github.io) and install, then reboot.                |
+| **Docker 24+ & Docker Compose** | Runs the local Postgres metadata DB in a container             | `brew install docker docker-compose` (or use Docker Desktop).                                                     |
+| **Rust 1.77+ (stable)**         | Builds the `sky‑mount` binary                                  | `brew install rustup && rustup toolchain install stable && rustup default stable`                                 |
+| **AWS credentials**             | Sky‑Mount talks to S3 using your default credential chain      | Export `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` **or** rely on `~/.aws/credentials` / IAM role. |
 
-    # Create a directory
-    mkdir ~/s3-drive/a-new-folder
-    ```
+> **Tip (macOS 14+)** System Integrity Protection blocks kexts by default. After installing MacFUSE you may have to allow the developer certificate in **System Settings ▸ Privacy & Security ▸ Developer Tools** and reboot once.
 
-### Unmounting the Filesystem
+---
 
-1.  **Graceful Unmount (Recommended)**: Return to the terminal where `sky-mount` is running and press **`Ctrl-C`**. The program will perform a clean unmount.
+### 2  Bring up the metadata database
 
-2.  **Force Unmount**: If the original terminal is not accessible, you can force the unmount using the system's utility. The command is the same on both platforms.
-    ```bash
-    umount ~/s3-drive
-    ```
+```bash
+# From the repo root
+$ docker-compose up -d postgres
+```
+
+This spins up a single‑node Postgres instance whose credentials match the values hard‑coded in `mount.sh` (`fsuser/secret` → DB `fsmeta`).
+
+---
+
+### 3  Build the project
+
+```bash
+$ cargo build --release
+```
+
+The binary is written to `target/release/sky-mount`.
+
+---
+
+### 4  Mount the bucket
+
+```bash
+# Example: mount the bucket "my‑bucket" at ~/Sky
+# (the script will create the directory if needed)
+$ ./scripts/mount.sh -b my-bucket -m ~/Sky
+```
+
+What the script does:
+
+1. Verifies Docker, Cargo, and MacFUSE are present.
+2. Ensures the Postgres container is up.
+3. Builds the release binary if necessary.
+4. Exports any AWS creds you passed via `-a` / `-s` / `-r`.
+5. Executes the binary **with three positional arguments**.
+
+```text
+sky-mount <BUCKET_NAME> <DATABASE_URL> <MOUNT_POINT>
+```
+
+The `DATABASE_URL` string is constructed inside the script from the compose variables so you do **not** have to export it yourself.
+
+When the mount is active you can `cd` into the directory and interact with S3 just like a local drive:
+
+```bash
+$ ls ~/Sky
+projects/  README.pdf  data.csv
+$ cp ~/Downloads/photo.jpg ~/Sky/uploads/
+```
+
+To unmount press **Ctrl‑C** in the terminal that is running the script, or in another shell run:
+
+```bash
+$ umount ~/Sky   # or `diskutil unmount ~/Sky` on macOS
+```
+
+---
+
+### 5  Troubleshooting
+
+| Symptom                                    | Fix                                                                                                                                     |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| *mount.sh exits with “Fuse daemon exited”* | Make sure you rebooted after installing MacFUSE and allowed the kernel extension in System Settings.                                    |
+| *Postgres connection refused*              | `docker compose logs postgres` – verify the container is listening on port 5432 and that `DB_HOST` in the script points to `localhost`. |
+| *Permission denied writing files*          | Check the UNIX uid/gid you used to mount; they are stored as object metadata and enforced by Sky‑Mount.                                 |
+
+---
+
+### 6. Known Issues & Limitations
+
+| Issue                             | Symptom / Error                                                                                                   | Work-around                                                                             |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| **macOS `cp` uses `fcopyfile()`** | `cp: fcopyfile failed: Operation not supported on socket` when copying into the mount (especially large files).   | Use `rsync`, `cp --no-clone`, or any tool that performs a straightforward read/write copy. |
+| **Single-part uploads only**      | Files ≥ 5 GiB fail with `EntityTooLarge` / `E2BIG`.                                                               | Split the file or wait for forthcoming multipart-upload support.                        |
+| **Large directory seeding**       | First `ls` on a prefix with millions of objects stalls for seconds/minutes.                                       | Pre-seed with the planned `--warm-dir` flag, or reorganize the bucket into smaller prefixes. |
+| **macOS temp-file rename races**  | Occasional `ENOENT` during atomic-save in highly contended directories.                                           | Retry the save; long-term fix is to move to `RENAME_EXCHANGE`.                          |
+| **Case collisions**               | `Foo.txt` and `foo.txt` become distinct objects even on case-insensitive host filesystems.                        | Keep object names in a consistent case; case-folded lookup planned.                     |
+
