@@ -6,6 +6,7 @@ use aws_sdk_s3::{
     types::{CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier},
 };
 use fuser::FileType;
+use futures::future::join_all;
 
 // Constants for Multipart Upload
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
@@ -337,6 +338,8 @@ impl ObjectStore {
         Ok(())
     }
 
+    // In the impl ObjectStore block
+
     async fn upload_multipart(&self, key: &str, data: Vec<u8>) -> Result<(), FsError> {
         let mpu = self
             .s3
@@ -350,21 +353,64 @@ impl ObjectStore {
             .upload_id
             .ok_or_else(|| FsError::S3("S3 did not return an upload ID".into()))?;
 
-        let mut completed_parts = Vec::new();
-        let mut part_number = 1;
+        let mut upload_tasks = Vec::new();
 
-        for chunk in data.chunks(MIN_PART_SIZE) {
-            match self
-                .upload_part(&upload_id, key, part_number, chunk.to_vec())
-                .await
-            {
-                Ok(part) => completed_parts.push(part),
-                Err(e) => {
+        for (i, chunk) in data.chunks(MIN_PART_SIZE).enumerate() {
+            let part_number = (i + 1) as i32;
+            let s3_client = self.s3.clone();
+            let bucket_clone = self.bucket.clone();
+            let key_clone = key.to_string();
+            let upload_id_clone = upload_id.clone();
+            let chunk_data = chunk.to_vec();
+
+            let task = tokio::task::spawn(async move {
+                // Map the S3 SDK error to our custom FsError for a consistent return type.
+                let part_resp = s3_client
+                    .upload_part()
+                    .bucket(&bucket_clone)
+                    .key(&key_clone)
+                    .upload_id(&upload_id_clone)
+                    .part_number(part_number)
+                    .body(ByteStream::from(chunk_data))
+                    .send()
+                    .await
+                    .map_err(|e| FsError::S3(e.to_string()))?;
+
+                // ETag is optional in the response, but required for CompletedPart.
+                // We must handle the case where it's missing.
+                let e_tag = part_resp.e_tag.ok_or_else(|| {
+                    FsError::S3(
+                        "S3 response for an uploaded part was missing the required ETag".into(),
+                    )
+                })?;
+
+                // --- FIX IS HERE ---
+                // .build() is now infallible because the compiler ensures e_tag and part_number are set.
+                // It returns a `CompletedPart` directly, not a `Result`.
+                let completed_part = CompletedPart::builder()
+                    .e_tag(e_tag)
+                    .part_number(part_number)
+                    .build(); // No `?` or `map_err` needed here.
+
+                Ok::<_, FsError>(completed_part)
+            });
+
+            upload_tasks.push(task);
+        }
+
+        let task_results = join_all(upload_tasks).await;
+
+        let mut completed_parts = Vec::new();
+        for result in task_results {
+            match result {
+                Ok(Ok(part)) => {
+                    completed_parts.push(part);
+                }
+                Ok(Err(fs_error)) => {
                     tracing::error!(
-                        "Aborting multipart upload for {} upload_id={}. {}",
+                        "A part upload failed for key '{}', aborting multipart upload. Error: {}",
                         key,
-                        upload_id,
-                        e
+                        fs_error
                     );
                     self.s3
                         .abort_multipart_upload()
@@ -373,15 +419,33 @@ impl ObjectStore {
                         .upload_id(&upload_id)
                         .send()
                         .await?;
-                    return Err(e);
+                    return Err(fs_error);
+                }
+                Err(join_error) => {
+                    tracing::error!(
+                        "A part upload task failed for key '{}', aborting multipart upload. Error: {}",
+                        key,
+                        join_error
+                    );
+                    self.s3
+                        .abort_multipart_upload()
+                        .bucket(&self.bucket)
+                        .key(key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await?;
+                    return Err(FsError::S3(join_error.to_string()));
                 }
             }
-            part_number += 1;
         }
 
+        completed_parts.sort_by_key(|p| p.part_number);
+
+        let completed_parts_len = completed_parts.len();
         let mpu_parts = CompletedMultipartUpload::builder()
             .set_parts(Some(completed_parts))
             .build();
+
         self.s3
             .complete_multipart_upload()
             .bucket(&self.bucket)
@@ -390,32 +454,12 @@ impl ObjectStore {
             .multipart_upload(mpu_parts)
             .send()
             .await?;
-        tracing::debug!("successfully uploaded {} parts for {}", part_number, key);
+
+        tracing::debug!(
+            "Successfully uploaded {} parts for key '{}'",
+            completed_parts_len,
+            key
+        );
         Ok(())
-    }
-
-    async fn upload_part(
-        &self,
-        upload_id: &str,
-        key: &str,
-        part_number: i32,
-        data: Vec<u8>,
-    ) -> Result<CompletedPart, FsError> {
-        let stream = ByteStream::from(data);
-        let part_resp = self
-            .s3
-            .upload_part()
-            .bucket(&self.bucket)
-            .key(key)
-            .upload_id(upload_id)
-            .part_number(part_number)
-            .body(stream)
-            .send()
-            .await?;
-
-        Ok(CompletedPart::builder()
-            .e_tag(part_resp.e_tag.unwrap_or_default())
-            .part_number(part_number)
-            .build())
     }
 }

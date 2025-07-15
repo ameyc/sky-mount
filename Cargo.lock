@@ -2801,6 +2801,7 @@ dependencies = [
  "dashmap",
  "foundationdb",
  "fuser",
+ "futures",
  "libc",
  "seahash",
  "serde",
