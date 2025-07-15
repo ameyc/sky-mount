@@ -9,7 +9,7 @@ Sky-Mount is a proof-of-concept filesystem driver, written in Rust, that allows 
 *   **Full Directory Support**: Create, delete, and list directories.
 *   **POSIX Permissions**: File ownership (`uid`, `gid`) and permissions (`mode`) are stored as S3 object metadata and enforced.
 *   **Efficient Reads**: Supports seeked reads to download only the necessary portions of large files.
-*   **Atomic Operations**: `rename` and `unlink` operations are designed to be atomic.
+*   **Atomic Operations**: `rename` and `unlink` operations are designed to minic atomicity (s3 isnt atomic).
 *   **Optimized Writes**: In-memory write buffering minimizes latency for applications performing many small writes.
 
 ### Design & Trade-offs
