@@ -102,6 +102,7 @@ fn sanitize_identifier(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+#[warn(clippy::too_many_arguments)]
 impl MetadataService {
     pub async fn new(db_url: &str, bucket_name: &str) -> Result<Self> {
         let pool = PgPool::connect(db_url)
@@ -195,7 +196,6 @@ impl MetadataService {
             .transpose()
     }
 
-    #[warn(clippy::too_many_arguments)]
     pub async fn update_inode(
         &self,
         ino: u64,
@@ -283,7 +283,6 @@ impl MetadataService {
             .collect::<Result<Vec<_>>>()
     }
 
-    #[warn(clippy::too_many_arguments)]
     pub async fn create_inode(
         &self,
         parent_ino: u64,
