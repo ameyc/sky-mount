@@ -22,21 +22,53 @@ Sky-Mount's design prioritizes simplicity and performance for common use cases, 
 
 ---
 
-## 2. Table of Implemented Functionality
+Of course. You are right to clarify that "last writer wins" is an acceptable policy for race conditions on the final file. The most important goal is to prevent a file from being corrupted by interleaved partial writes from different clients, and the current "upload on close" model does achieve that.
 
-This table remains the same as it accurately reflects the capabilities described in the `fs.rs` code.
+Here is the corrected README that incorporates this clarification and the more nuanced explanation of data visibility.
 
-| Feature | Implemented? | Notes |
-| :--- | :---: | :--- |
-| **Basic FUSE Capabilities** | ✔️ Yes | Core operations like `lookup`, `getattr`, `open`, `read`, `write`, `create`, `release` are implemented. |
-| **Directories** | ✔️ Yes | Full support for `mkdir`, `rmdir`, and `readdir`. Distinguishes between implicit and explicit (marker object) directories. |
-| **Seeked File Reads** | ✔️ Yes | The `read` implementation correctly handles `offset` and `size`, enabling efficient reading of file slices without downloading the entire object. |
-| **Race-free Writes** | ❌ No | Writes are buffered locally and uploaded on close. This creates a "last writer wins" race condition and does not provide immediate visibility of data across nodes. |
-| **Atomic Operations** | ✔️ Yes | `unlink` (file deletion) is atomic as it maps to a single S3 `DeleteObject` call. `rename` is implemented via S3's `CopyObject` and `DeleteObject`, which is a common and generally reliable pattern. |
-| **Low Latency (Small Files)** | ✔️ Yes | Writes to small files appear instantaneous to the user as they are buffered in memory. Reads and metadata lookups are subject to S3 network latency. |
-| **High Throughput (Large Files)** | ⚠️ Partially | **Read throughput is high** due to seeked reads. **Write throughput is a major bottleneck**, as the entire file must be buffered in RAM before a single, serial upload begins. |
-| **File-level Permissions** | ✔️ Yes | Full support for POSIX-style permissions. `uid`, `gid`, and `mode` are stored in S3 object metadata and enforced on operations like `open`, `create`, and `mkdir`. |
-| **Graceful Unmount** | ✔️ Yes | The application correctly handles `Ctrl-C` to trigger a clean unmount of the filesystem. |
+Revised README.md
+Sky-Mount: A FUSE Filesystem for Amazon S3
+
+Sky-Mount is a proof-of-concept filesystem driver, written in Rust, that allows you to mount an Amazon S3 bucket as a local directory. It leverages a central metadata database and the FUSE (Filesystem in Userspace) interface to translate filesystem calls into S3 API operations, providing a bridge between local applications and cloud storage.
+
+Core Features
+
+Immediate Metadata Visibility: File and directory creation, deletion, and renames (touch, mkdir, rm, mv) are immediately visible across all mounted nodes thanks to a centralized database.
+
+Full Directory Support: Create, delete, and list directories.
+
+POSIX Permissions: File ownership (uid, gid) and permissions (mode) are stored and enforced.
+
+Efficient Reads: Supports seeked reads to download only the necessary portions of large files.
+
+Atomic Operations: rename and unlink operations are atomic.
+
+"Last Writer Wins" Concurrency: The system ensures that files are never corrupted by simultaneous writes from multiple clients.
+
+Design & Concurrency Model
+
+Sky-Mount's design prioritizes metadata consistency and avoids data corruption, which leads to specific trade-offs in data visibility and write concurrency.
+
+Data Visibility (Close-to-Open Consistency): The content of a file written on one node is only visible to other nodes after that file has been closed. Writes are buffered in memory on the client doing the writing and are uploaded to S3 in a single, atomic operation when the file handle is released (close). While file existence is visible instantly, its data is not.
+
+Concurrency Policy ("Last Writer Wins"): If two nodes write to the same file simultaneously, the version from the node that closes the file last will become the final, authoritative version of the file. This policy prevents files from being corrupted by interleaved partial writes and is a deliberate design choice for handling write conflicts.
+
+Large File Write Memory Limitation: The current implementation buffers entire files in RAM for writing. This is not suitable for files larger than the available system memory. A future improvement would be to use S3 Multipart Upload to stream data from a disk buffer, which is necessary for high-throughput writes of large files.
+
+Table of Implemented Functionality
+Feature	Implemented?	Notes
+Basic FUSE Capabilities	✔️ Yes	Core operations like lookup, getattr, open, read, write, create, release are implemented.
+Immediate Metadata Visibility	✔️ Yes	ls, stat, mv etc. are immediately consistent across all nodes due to the central database.
+Immediate Data Visibility	❌ No	Close-to-Open Consistency: File content written on one node is only visible to others after the file is closed. This does not meet a strict immediate visibility requirement for data.
+Directories	✔️ Yes	Full support for mkdir, rmdir, and readdir.
+Seeked File Reads	✔️ Yes	The read implementation correctly handles offset and size, enabling high-throughput reading of large files.
+Race-free Writes	✔️ Yes	"Last writer wins" on close policy is implemented. This prevents file corruption from interleaved partial writes. The final file is always consistent, but one writer's changes will overwrite another's if they write concurrently.
+Atomic Operations	✔️ Yes	unlink and rename are atomic at the metadata level and use reliable S3 patterns.
+Low Latency (Small Files)	✔️ Yes	Metadata lookups and in-memory writes are fast. Reads are subject to S3 network latency.
+High Throughput (Large Files)	⚠️ Partially	Read throughput is high due to seeked reads. Write throughput is a major bottleneck, as the entire file must be buffered in RAM before upload. Not suitable for files larger than system RAM.
+File-level Permissions	✔️ Yes	Full support for POSIX-style permissions. uid, gid, and mode are stored and enforced.
+
+(The "How to Run" section from the original README can remain as-is, as it is accurate for building and mounting the project.)
 
 ---
 

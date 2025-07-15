@@ -5,10 +5,8 @@ use fuser::{
     ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
 use std::{
-    collections::{HashMap, HashSet},
     ffi::OsStr,
     path::PathBuf,
-    sync::Mutex,
     time::{Duration, SystemTime},
 };
 use time::OffsetDateTime;
@@ -22,7 +20,7 @@ use crate::{
     utils,
 };
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(15);
 const S3_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024; // 5 TiB
 
 fn path_to_ino(path: &Path) -> u64 {
