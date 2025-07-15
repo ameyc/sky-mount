@@ -34,7 +34,7 @@ Sky-Mount's design prioritizes simplicity and performance for common use cases, 
 | **Race-free Writes** | ✔️ Yes | **"Last writer wins" on close policy is implemented**. This prevents file corruption from interleaved partial writes. The final file is always consistent, but one writer's changes will overwrite another's if they write concurrently. |
 | **Atomic Operations** | ✔️ Yes | `unlink` and `rename` are atomic at the metadata level and use reliable S3 patterns. |
 | **Low Latency (Small Files)** | ✔️ Yes | Metadata lookups and in-memory writes are fast. Reads are subject to S3 network latency. |
-| **High Throughput (Large Files)** | ⚠️ Partially | **Read throughput is high** due to seeked reads. **Write throughput is a major bottleneck**, as the entire file must be buffered in RAM before upload. Not suitable for files larger than system RAM. |
+| **High Throughput (Large Files)** | ⚠️ Partially | **Read throughput is high** due to seeked reads. **Write throughput is a major bottleneck**, as the entire file must be buffered in RAM before upload, nevertheless we use async multipart uploads for large files. Not suitable for files larger than system RAM. |
 | **File-level Permissions** | ✔️ Yes | Full support for POSIX-style permissions. `uid`, `gid`, and `mode` are stored and enforced. |
 
 
