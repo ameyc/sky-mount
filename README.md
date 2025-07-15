@@ -8,28 +8,24 @@ Sky-Mount is a proof-of-concept filesystem driver, written in Rust, that allows 
 ### Table of Contents
 
 * [1. README.md](#1-readmemd)
-
     * [Core Features](#core-features)
     * [Design & Trade-offs](#design--trade-offs)
     * [Table of Implemented Functionality](#table-of-implemented-functionality)
     * [How to Run the Project (Linux & macOS)](#how-to-run-the-project-linux--macos)
-
       * [Prerequisites](#prerequisites)
-
         * [On macOS](#on-macos)
         * [On Linux](#on-linux)
         * [For Both Systems](#for-both-systems)
       * [Running Integration Tests (Local)](#running-integration-tests-local)
       * [Building the Executable](#building-the-executable)
-      
     * [Mounting Sky-Mount S3 Filesystem](#mounting-sky-mount-s3-filesystem)
-
       * [1 Prerequisites](#1--prerequisites)
       * [2 Bring up the metadata database](#2--bring-up-the-metadata-database)
       * [3 Build the project](#3--build-the-project)
       * [4 Mount the bucket](#4--mount-the-bucket)
       * [5 Troubleshooting](#5--troubleshooting)
       * [6 Known Issues & Limitations](#6-known-issues--limitations)
+   * [Running E2E Integration tests](#running-e2e-integration-tests)
 
 
 ### Core Features
@@ -225,3 +221,6 @@ $ umount ~/Sky   # or `diskutil unmount ~/Sky` on macOS
 | **macOS temp-file rename races**  | Occasional `ENOENT` during atomic-save in highly contended directories.                                           | Retry the save; long-term fix is to move to `RENAME_EXCHANGE`.                          |
 | **Case collisions**               | `Foo.txt` and `foo.txt` become distinct objects even on case-insensitive host filesystems.                        | Keep object names in a consistent case; case-folded lookup planned.                     |
 
+### Running E2E Integration tests
+
+```cargo test --package sky-mount --test e2e_integration -- filesystem_contract_tests --exact --show-output --ignored   ```
