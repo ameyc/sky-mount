@@ -5,6 +5,7 @@ use aws_sdk_s3::{
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier},
 };
+use dashmap::DashMap;
 use fuser::FileType;
 use futures::future::join_all;
 
@@ -15,6 +16,7 @@ const MULTIPART_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB
 pub struct ObjectStore {
     pub s3: Client,
     pub bucket: String,
+    uploads: DashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -49,11 +51,30 @@ impl ObjectStore {
             FsError::S3(format!("Bucket '{}' not found or no permissions", bucket))
         })?;
 
-        Ok(Self { s3, bucket })
+        Ok(Self {
+            s3,
+            bucket,
+            uploads: DashMap::new(),
+        })
     }
 }
 
+fn bytes_of_key(upload_id: &str) -> Result<&str, FsError> {
+    // store upload_id→key mapping in a DashMap if needed;
+    // for now assume caller already knows the key (most callers do)
+    Err(FsError::S3(format!(
+        "ObjectStore helpers need the object key for upload-id {upload_id}"
+    )))
+}
+
 impl ObjectStore {
+    fn key_for_upload(&self, upload_id: &str) -> Result<String, FsError> {
+        self.uploads
+            .get(upload_id)
+            .map(|k| k.clone())
+            .ok_or_else(|| FsError::S3(format!("unknown upload-id {}", upload_id)))
+    }
+
     pub async fn list_directory(&self, prefix: &str) -> Result<Vec<DirectoryEntry>, FsError> {
         let mut entries = Vec::new();
         let mut stream = self
@@ -462,4 +483,80 @@ impl ObjectStore {
         );
         Ok(())
     }
+
+    pub async fn start_multipart(&self, key: &str) -> Result<String, FsError> {
+        let out = self
+            .s3
+            .create_multipart_upload()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await?;
+
+        let upload_id = out
+            .upload_id
+            .ok_or_else(|| FsError::S3("S3 did not return an upload-id".into()))?;
+
+        // remember the mapping so later calls don’t need the key
+        self.uploads.insert(upload_id.clone(), key.to_string());
+        Ok(upload_id)
+    }
+
+    /// Upload a single part and return the `CompletedPart`.
+    pub async fn upload_part(
+        &self,
+        upload_id: &str,
+        part_no: i32,
+        bytes: Vec<u8>,
+    ) -> Result<CompletedPart, FsError> {
+        let key = self.key_for_upload(upload_id)?;
+
+        let out = self
+            .s3
+            .upload_part()
+            .bucket(&self.bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .part_number(part_no)
+            .body(ByteStream::from(bytes))
+            .send()
+            .await?;
+
+        let etag = out.e_tag.ok_or_else(|| {
+            FsError::S3("S3 response for an uploaded part was missing the required ETag".into())
+        })?;
+
+        Ok(CompletedPart::builder()
+            .e_tag(etag)
+            .part_number(part_no)
+            .build())
+    }
+
+    /// Finish (or abort) the MPU and clean up the map.
+    pub async fn complete_multipart(
+        &self,
+        upload_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<(), FsError> {
+        let key = self.key_for_upload(upload_id)?;
+
+        let mpu_parts = CompletedMultipartUpload::builder()
+            .set_parts(Some(parts.to_vec()))
+            .build();
+
+        self.s3
+            .complete_multipart_upload()
+            .bucket(&self.bucket)
+            .key(&key)
+            .upload_id(upload_id)
+            .multipart_upload(mpu_parts)
+            .send()
+            .await?;
+
+        // success → drop the mapping
+        self.uploads.remove(upload_id);
+        Ok(())
+    }
+
+    // Helper so we don’t re-compute the key in every ca
 }

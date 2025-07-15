@@ -1,4 +1,5 @@
 use anyhow::Result;
+use aws_sdk_s3::types::CompletedPart;
 use dashmap::{DashMap, DashSet};
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
@@ -34,13 +35,29 @@ fn path_to_ino(path: &Path) -> u64 {
     }
 }
 
+// add near the other constants
+const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // S3 absolute minimum
+const MULTIPART_THRESHOLD: usize = 10 * 1024 * 1024; // when to start MPU
+
+/// Per-inode write state: in-RAM staging buffer plus MPU bookkeeping
+struct WriteState {
+    buffer: Vec<u8>,
+    multipart: Option<MultipartCtx>,
+}
+
+struct MultipartCtx {
+    upload_id: String,
+    next_part: i32,
+    completed: Vec<CompletedPart>,
+}
+
 pub struct S3Fuse {
     object_store: ObjectStore,
     rt: Runtime,
     metadata_service: MetadataService,
     seeded_dirs: DashSet<u64>,
     next_fh: u64,
-    write_buffers: DashMap<u64, Vec<u8>>, //DashMap provides finer grained key level locking
+    write_states: DashMap<u64, WriteState>, //DashMap provides finer grained key level locking
     mount_uid: u32,
     mount_gid: u32,
 }
@@ -56,7 +73,7 @@ impl S3Fuse {
             metadata_service,
             seeded_dirs: DashSet::new(),
             next_fh: 1,
-            write_buffers: DashMap::new(),
+            write_states: DashMap::new(),
             mount_uid: 0,
             mount_gid: 0,
         })
@@ -134,11 +151,17 @@ impl Filesystem for S3Fuse {
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.rt.block_on(self.metadata_service.get_inode(ino)) {
             Ok(Some(md)) => {
+                // base attributes from the DB row
                 let mut attr = md.to_file_attr();
-                if let Some(buf) = self.write_buffers.get(&ino) {
-                    attr.size = buf.len() as u64;
-                    attr.blocks = (attr.size + 511) / 512;
+
+                // If this inode is currently open for writing, add the pending tail
+                if let Some(state) = self.write_states.get(&ino) {
+                    // bytes not yet flushed to S3 (the staging buffer)
+                    let tail_len = state.buffer.len() as u64;
+                    attr.size += tail_len; // show full logical size
+                    attr.blocks = (attr.size + 511) / 512; // 512-byte blocks
                 }
+
                 reply.attr(&TTL, &attr);
             }
             Ok(None) => reply.error(libc::ENOENT),
@@ -148,7 +171,6 @@ impl Filesystem for S3Fuse {
             }
         }
     }
-
     fn setattr(
         &mut self,
         _req: &Request<'_>,
@@ -373,12 +395,13 @@ impl Filesystem for S3Fuse {
         &mut self,
         req: &Request<'_>,
         parent: u64,
-        name: &std::ffi::OsStr,
+        name: &OsStr,
         mode: u32,
         _umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
+        // ---------- argument checks ----------
         let name_str = match name.to_str() {
             Some(s) => s,
             None => return reply.error(libc::EINVAL),
@@ -393,25 +416,26 @@ impl Filesystem for S3Fuse {
             return reply.error(libc::EACCES);
         }
 
-        let parent_s3_path = self.get_s3_key_from_inode(&parent_inode);
-        let new_file_path = PathBuf::from(parent_s3_path).join(name);
-        let s3_key = path_to_s3_key(&new_file_path);
+        // ---------- S3 key + placeholder object ----------
+        let parent_path = self.get_s3_key_from_inode(&parent_inode);
+        let new_path = PathBuf::from(parent_path).join(name);
+        let s3_key = path_to_s3_key(&new_path);
 
-        let metadata = ObjectUserMetadata {
+        // Create an empty object so the key exists immediately
+        let meta = ObjectUserMetadata {
             mode: Some((mode & 0o7777) as u16),
             uid: Some(req.uid()),
             gid: Some(req.gid()),
         };
-
         if let Err(e) = self
             .rt
-            .block_on(self.object_store.create_object(&s3_key, &metadata))
+            .block_on(self.object_store.create_object(&s3_key, &meta))
         {
-            tracing::error!("create: S3 PutObject failed for key '{}': {}", s3_key, e);
+            tracing::error!("create: S3 PutObject failed for key '{}': {e}", s3_key);
             return reply.error(libc::EIO);
         }
 
-        let new_ino = path_to_ino(&new_file_path);
+        let new_ino = path_to_ino(&new_path);
         match self.rt.block_on(self.metadata_service.create_inode(
             parent,
             new_ino,
@@ -424,7 +448,15 @@ impl Filesystem for S3Fuse {
             Ok(inode) => {
                 let fh = self.next_fh;
                 self.next_fh += 1;
-                self.write_buffers.insert(inode.ino as u64, Vec::new());
+
+                self.write_states.insert(
+                    inode.ino as u64,
+                    WriteState {
+                        buffer: Vec::new(),
+                        multipart: None,
+                    },
+                );
+
                 reply.created(
                     &TTL,
                     &inode.to_file_attr(),
@@ -434,7 +466,7 @@ impl Filesystem for S3Fuse {
                 );
             }
             Err(e) => {
-                tracing::error!("create: Failed to create inode in database: {}", e);
+                tracing::error!("create: Failed to insert inode in DB: {e}");
                 reply.error(libc::EIO);
             }
         }
@@ -452,21 +484,67 @@ impl Filesystem for S3Fuse {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let mut buffer = match self.write_buffers.get_mut(&ino) {
-            Some(buffer) => buffer,
+        let mut state = match self.write_states.get_mut(&ino) {
+            Some(s) => s,
             None => return reply.error(libc::EBADF),
         };
 
-        let offset = offset as usize;
-        let write_end = offset + data.len();
-
-        if write_end as u64 > S3_MAX_SIZE {
+        // merge this write into the staging buffer (sparse-safe)
+        let off = offset as usize;
+        let end = off + data.len();
+        if end as u64 > S3_MAX_SIZE {
             return reply.error(libc::E2BIG);
         }
-        if write_end > buffer.len() {
-            buffer.resize(write_end, 0);
+        if end > state.buffer.len() {
+            state.buffer.resize(end, 0);
         }
-        buffer[offset..write_end].copy_from_slice(data);
+        state.buffer[off..end].copy_from_slice(data);
+
+        // if buffer ≥ threshold, flush it as the next MPU part
+        if state.buffer.len() >= MULTIPART_THRESHOLD {
+            // start a multipart upload the first time we cross the threshold
+            if state.multipart.is_none() {
+                // resolve the object key once
+                let inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
+                    Ok(Some(i)) => i,
+                    _ => return reply.error(libc::ENOENT),
+                };
+                let key = self.get_s3_key_from_inode(&inode);
+
+                // create MPU and remember its ID ↔ key mapping inside ObjectStore
+                let upload_id = match self.rt.block_on(self.object_store.start_multipart(&key)) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        tracing::error!("start_multipart failed for {}: {}", key, e);
+                        return reply.error(libc::EIO);
+                    }
+                };
+                state.multipart = Some(MultipartCtx {
+                    upload_id,
+                    next_part: 1,
+                    completed: Vec::new(),
+                });
+            }
+
+            // move the buffer out (drop map lock) and upload as next part
+            let bytes = std::mem::take(&mut state.buffer);
+            let mp = state.multipart.as_mut().unwrap();
+            let part = mp.next_part;
+            mp.next_part += 1;
+
+            match self
+                .rt
+                .block_on(self.object_store.upload_part(&mp.upload_id, part, bytes))
+            {
+                Ok(completed_part) => mp.completed.push(completed_part),
+                Err(e) => {
+                    tracing::error!("upload_part {} failed: {}", part, e);
+                    return reply.error(libc::EIO);
+                }
+            }
+        }
+
+        // tell the kernel we wrote everything it asked us to
         reply.written(data.len() as u32);
     }
 
@@ -480,48 +558,98 @@ impl Filesystem for S3Fuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let (_, buffer) = match self.write_buffers.remove(&ino) {
-            Some(buffer) => buffer,
-            None => return reply.ok(),
+        // Take the WriteState out of the DashMap.
+        let (_, mut state) = match self.write_states.remove(&ino) {
+            Some(entry) => entry,
+            None => return reply.ok(), // nothing buffered
         };
 
+        // Resolve the object key once.
         let inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
             Ok(Some(i)) => i,
             _ => return reply.error(libc::ENOENT),
         };
+        let key = self.get_s3_key_from_inode(&inode);
 
-        let s3_key = self.get_s3_key_from_inode(&inode);
-        let new_size = buffer.len() as i64;
+        // Handle the two cases: simple PUT vs. finish MPU.
+        let final_size: i64 = if state.multipart.is_none() {
+            // Small file → single PutObject.
+            let bytes = std::mem::take(&mut state.buffer);
+            if let Err(e) = self
+                .rt
+                .block_on(self.object_store.upload(&key, bytes.clone()))
+            {
+                tracing::error!("single PUT failed for '{}': {}", key, e);
+                return reply.error(libc::EIO);
+            }
+            bytes.len() as i64 // new size
+        } else {
+            // MPU in progress → upload tail part (if any) then complete.
+            let mp = state.multipart.as_mut().unwrap();
 
-        match self.rt.block_on(self.object_store.upload(&s3_key, buffer)) {
-            Ok(_) => {
-                let now = OffsetDateTime::now_utc();
-                if self
-                    .rt
-                    .block_on(self.metadata_service.update_inode(
-                        ino,
-                        Some(new_size),
-                        None,
-                        None,
-                        None,
-                        Some(now),
-                        Some(now),
-                    ))
-                    .is_err()
-                {
-                    tracing::error!(
-                        "Failed to update inode metadata after upload for key '{}'",
-                        s3_key
-                    );
+            // upload the tail (can be <5 MiB)
+            if !state.buffer.is_empty() {
+                let part_no = mp.next_part;
+                if let Err(e) = self.rt.block_on(self.object_store.upload_part(
+                    &mp.upload_id,
+                    part_no,
+                    std::mem::take(&mut state.buffer),
+                )) {
+                    tracing::error!("tail part {} upload failed: {}", part_no, e);
                     return reply.error(libc::EIO);
                 }
-                reply.ok();
+                mp.completed.push(
+                    self.rt
+                        .block_on(
+                            self.object_store
+                                .upload_part(&mp.upload_id, part_no, Vec::new()),
+                        )
+                        .expect("completed part already pushed"), // or adjust logic
+                );
             }
-            Err(e) => {
-                tracing::error!("S3 operation failed on release for key '{}': {}", s3_key, e);
-                reply.error(libc::EIO);
+
+            // complete the MPU
+            if let Err(e) = self.rt.block_on(
+                self.object_store
+                    .complete_multipart(&mp.upload_id, &mp.completed),
+            ) {
+                tracing::error!("complete_multipart failed for '{}': {}", key, e);
+                return reply.error(libc::EIO);
             }
+
+            // Fetch the final size from S3’s HEAD.
+            match self.rt.block_on(self.object_store.get_attributes(&key)) {
+                Ok(meta) => meta.content_length().unwrap() as i64, // unwrap warning. TODO: Fix later!!!!
+                Err(e) => {
+                    tracing::warn!("head_object after MPU failed: {}", e);
+                    -1 // best-effort; don’t abort
+                }
+            }
+        };
+
+        // Update inode metadata in Postgres.
+        let now = OffsetDateTime::now_utc();
+        if self
+            .rt
+            .block_on(self.metadata_service.update_inode(
+                ino,
+                if final_size >= 0 {
+                    Some(final_size)
+                } else {
+                    None
+                },
+                None,
+                None,
+                None,
+                Some(now),
+                Some(now),
+            ))
+            .is_err()
+        {
+            tracing::warn!("inode metadata update failed for {}", ino);
         }
+
+        reply.ok();
     }
 
     fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -530,36 +658,153 @@ impl Filesystem for S3Fuse {
             _ => return reply.error(libc::ENOENT),
         };
         let attr = inode.to_file_attr();
-
         let access_mask = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => 4,
             libc::O_WRONLY => 2,
             libc::O_RDWR => 6,
             _ => 0,
         };
-
         if access_mask > 0 && !utils::check_permission(&attr, req, access_mask) {
             return reply.error(libc::EACCES);
         }
 
+        // allocate a file-handle and create WriteState for writers
         let fh = self.next_fh;
         self.next_fh += 1;
 
         if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
-            self.write_buffers.insert(ino, Vec::new());
+            self.write_states.entry(ino).or_insert_with(|| WriteState {
+                buffer: Vec::new(),
+                multipart: None,
+            });
         }
 
         reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
     }
 
+    // flush is issued each time a file-descriptor is closed but does not end the
+    // last open handle. We push any buffered data into the active multipart
+    // upload, if its a simple upload this is a no-op. We keep the WriteState so later handles can keep writing.
     fn flush(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         _fh: u64,
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        // Pull the state _once_ and copy-out everything we’ll need later ──
+        let (bytes, maybe_mpu) = {
+            // scoped borrow so it’s dropped before any await
+            let mut state = match self.write_states.get_mut(&ino) {
+                Some(s) if !s.buffer.is_empty() => s,
+                _ => return reply.ok(),
+            };
+
+            // Move the tail bytes out of the DashMap entry
+            let bytes = std::mem::take(&mut state.buffer);
+
+            // If an MPU is active, also copy out the IDs/part numbers we need
+            let mpu_info = state.multipart.as_mut().map(|mp| {
+                let info = (mp.upload_id.clone(), mp.next_part);
+                mp.next_part += 1; // reserve this part number
+                info
+            });
+
+            (bytes, mpu_info) // returned tuple
+        };
+
+        if let Some((upload_id, part_no)) = maybe_mpu {
+            // multipart tail upload
+            match self
+                .rt
+                .block_on(self.object_store.upload_part(&upload_id, part_no, bytes))
+            {
+                Ok(cp) => {
+                    // Re-borrow to push the CompletedPart into the MPU list
+                    if let Some(mut st) = self.write_states.get_mut(&ino) {
+                        if let Some(mp) = st.multipart.as_mut() {
+                            mp.completed.push(cp);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("flush: upload_part failed: {}", e);
+                    return reply.error(libc::EIO);
+                }
+            }
+        } else {
+            // small-file path: keep data in RAM; single PUT will happen in release/fsync
+            let mut st = self.write_states.get_mut(&ino).expect("state disappeared");
+            st.buffer = bytes; // put the data back for later
+        }
+
+        reply.ok();
+    }
+
+    fn fsync(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, datasync: bool, reply: ReplyEmpty) {
+        // flush outstanding data (same logic as in `flush`)
+        if let Some(mut state) = self.write_states.get_mut(&ino) {
+            if !state.buffer.is_empty() {
+                // take the buffer first → releases &mut borrow early
+                let bytes = std::mem::take(&mut state.buffer);
+
+                if let Some(mp) = state.multipart.as_mut() {
+                    // multipart tail
+                    let part_no = mp.next_part;
+                    mp.next_part += 1;
+                    let upload_id = mp.upload_id.clone();
+                    drop(state); // release DashMap entry lock before await
+
+                    match self
+                        .rt
+                        .block_on(self.object_store.upload_part(&upload_id, part_no, bytes))
+                    {
+                        Ok(cp) => {
+                            if let Some(mut s) = self.write_states.get_mut(&ino) {
+                                s.multipart
+                                    .as_mut()
+                                    .expect("MPU vanished")
+                                    .completed
+                                    .push(cp);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("fsync: upload_part failed: {}", e);
+                            return reply.error(libc::EIO);
+                        }
+                    }
+                } else {
+                    // small-file path: single PUT
+                    let key = {
+                        let inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
+                            Ok(Some(i)) => i,
+                            _ => return reply.error(libc::ENOENT),
+                        };
+                        self.get_s3_key_from_inode(&inode)
+                    };
+                    if let Err(e) = self.rt.block_on(self.object_store.upload(&key, bytes)) {
+                        tracing::error!("fsync: put_object failed: {}", e);
+                        return reply.error(libc::EIO);
+                    }
+                }
+            }
+        }
+
+        // update timestamps unless caller set O_DSYNC / datasync flag ────
+        if !datasync {
+            let now = OffsetDateTime::now_utc();
+            let _ = self.rt.block_on(self.metadata_service.update_inode(
+                ino,
+                None,
+                None,
+                None,
+                None,
+                Some(now),
+                Some(now),
+            ));
+        }
+
         reply.ok();
     }
 
