@@ -28,7 +28,7 @@ Sky-Mount's design prioritizes simplicity and performance for common use cases, 
 | :--- | :---: | :--- |
 | **Basic FUSE Capabilities** | ✔️ Yes | Core operations like `lookup`, `getattr`, `open`, `read`, `write`, `create`, `release` are implemented. |
 | **Immediate Metadata Visibility** | ✔️ Yes | `ls`, `stat`, `mv` etc. are immediately consistent across all nodes due to the central database. |
-| **Immediate Data Visibility** | ✔️ Yes | **Close-to-Open Consistency**: File content written on one node is only visible to others after the file is closed, bu the metadata is immediately visible. |
+| **Immediate Data Visibility** | ✔️ Yes | **Close-to-Open Consistency**: File content written on one node is only visible to others after the file is closed, but the metadata is immediately visible. |
 | **Directories** | ✔️ Yes | Full support for `mkdir`, `rmdir`, and `readdir`. |
 | **Seeked File Reads** | ✔️ Yes | The `read` implementation correctly handles `offset` and `size`, enabling high-throughput reading of large files. |
 | **Race-free Writes** | ✔️ Yes | **"Last writer wins" on close policy is implemented**. This prevents file corruption from interleaved partial writes. The final file is always consistent, but one writer's changes will overwrite another's if they write concurrently. |
