@@ -221,6 +221,6 @@ $ umount ~/Sky   # or `diskutil unmount ~/Sky` on macOS
 | **macOS temp-file rename races**  | Occasional `ENOENT` during atomic-save in highly contended directories.                                           | Retry the save; long-term fix is to move to `RENAME_EXCHANGE`.                          |
 | **Case collisions**               | `Foo.txt` and `foo.txt` become distinct objects even on case-insensitive host filesystems.                        | Keep object names in a consistent case; case-folded lookup planned.                     |
 
-### Running E2E Integration tests
+## Running E2E Integration tests
 
 ```cargo test --package sky-mount --test e2e_integration -- filesystem_contract_tests --exact --show-output --ignored   ```
