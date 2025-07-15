@@ -880,6 +880,6 @@ impl Filesystem for S3Fuse {
     }
 }
 
-fn path_to_s3_key(path: &PathBuf) -> String {
+fn path_to_s3_key(path: &Path) -> String {
     path.to_string_lossy().trim_start_matches('/').to_string()
 }

@@ -195,6 +195,7 @@ impl MetadataService {
             .transpose()
     }
 
+    #[warn(clippy::too_many_arguments)]
     pub async fn update_inode(
         &self,
         ino: u64,
@@ -282,6 +283,7 @@ impl MetadataService {
             .collect::<Result<Vec<_>>>()
     }
 
+    #[warn(clippy::too_many_arguments)]
     pub async fn create_inode(
         &self,
         parent_ino: u64,
