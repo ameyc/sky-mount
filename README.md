@@ -1,9 +1,36 @@
 
-## 1. README.md
+## 1. READ
 
 # Sky-Mount: A FUSE Filesystem for Amazon S3
 
 Sky-Mount is a proof-of-concept filesystem driver, written in Rust, that allows you to mount an Amazon S3 bucket as a local directory on a Unix machine. It leverages the FUSE (Filesystem in Userspace) interface to translate standard filesystem calls (like `ls`, `cat`, `mkdir`) into S3 API operations, providing a seamless bridge between local applications and cloud storage.
+
+### Table of Contents
+
+* [1. README.md](#1-readmemd)
+
+    * [Core Features](#core-features)
+    * [Design & Trade-offs](#design--trade-offs)
+    * [Table of Implemented Functionality](#table-of-implemented-functionality)
+    * [How to Run the Project (Linux & macOS)](#how-to-run-the-project-linux--macos)
+
+      * [Prerequisites](#prerequisites)
+
+        * [On macOS](#on-macos)
+        * [On Linux](#on-linux)
+        * [For Both Systems](#for-both-systems)
+      * [Running Integration Tests (Local)](#running-integration-tests-local)
+      * [Building the Executable](#building-the-executable)
+      
+    * [Mounting Sky-Mount S3 Filesystem](#mounting-sky-mount-s3-filesystem)
+
+      * [1 Prerequisites](#1--prerequisites)
+      * [2 Bring up the metadata database](#2--bring-up-the-metadata-database)
+      * [3 Build the project](#3--build-the-project)
+      * [4 Mount the bucket](#4--mount-the-bucket)
+      * [5 Troubleshooting](#5--troubleshooting)
+      * [6 Known Issues & Limitations](#6-known-issues--limitations)
+
 
 ### Core Features
 *   **Full Directory Support**: Create, delete, and list directories.
