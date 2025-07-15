@@ -9,6 +9,8 @@ use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
+const DB_URL: &str = "postgresql://fsuser:secret@localhost:5432/fsmeta";
+
 // ==========================================================================================
 //  The Test Harness: MountGuard
 //
@@ -25,7 +27,7 @@ struct MountGuard {
 
 impl MountGuard {
     /// Mounts the filesystem for testing. Panics on failure.
-    fn new(bin_path: &Path, bucket_name: &str) -> Self {
+    fn new(bin_path: &Path, bucket_name: &str, db_url: &str) -> Self {
         let temp_dir = tempfile::Builder::new()
             .prefix("s3fuse-e2e-")
             .tempdir()
@@ -41,6 +43,7 @@ impl MountGuard {
         let mut child = Command::new(bin_path)
             .arg("--") // Use explicit flags for clarity
             .arg(bucket_name)
+            .arg(db_url)
             .arg(mount_point.as_os_str())
             .spawn()
             .expect("Failed to spawn s3fuse process");
@@ -130,9 +133,8 @@ fn filesystem_contract_tests() {
     rt.block_on(create_test_bucket(&bucket_name));
 
     let bin_path = build_project();
-
     // --- 2. Mount Filesystem (RAII Guard) ---
-    let guard = MountGuard::new(&bin_path, &bucket_name);
+    let guard = MountGuard::new(&bin_path, &bucket_name, DB_URL);
     let mount_point = guard.mount_point();
 
     // --- 3. Run Test Scenarios ---
@@ -149,7 +151,7 @@ fn filesystem_contract_tests() {
     test_scenario_deeply_nested(&base_path.join("nested"));
     test_scenario_special_chars(&base_path.join("special_chars"));
     test_scenario_large_file(&base_path.join("large_file"));
-    //test_scenario_concurrent_writes(&base_path.join("concurrent_writes"));
+    test_scenario_concurrent_writes(&base_path.join("concurrent_writes"));
     test_scenario_permission_denied(&base_path.join("perms_denied"));
 
     // --- 4. Automatic Teardown ---

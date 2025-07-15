@@ -21,6 +21,7 @@ pub fn s3_meta_to_file_attr(
     let empty_map = HashMap::new();
     let s3_meta = meta.metadata().unwrap_or(&empty_map);
 
+    // NOTE: This bug was a massive pain in the rear to track down.
     let perm = match s3_meta.get("mode") {
         Some(s) => match u16::from_str_radix(s.trim_start_matches("0o"), 8) {
             Ok(m) => {
