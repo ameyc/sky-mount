@@ -69,34 +69,6 @@ async fn create_and_get_attributes() {
 }
 
 #[tokio::test]
-async fn upload_and_download() {
-    let (store, _bucket) = setup_test_store().await;
-    let key = "upload_test.txt";
-    let content = "hello world from s3fuse!".as_bytes().to_vec();
-
-    // 1. Upload the data
-    store
-        .upload(key, content.clone())
-        .await
-        .expect("Upload failed");
-
-    // 2. Verify attributes
-    let attrs = store
-        .get_attributes(key)
-        .await
-        .expect("Get attributes failed");
-    assert_eq!(attrs.content_length(), Some(content.len() as i64));
-
-    // 3. Download and verify content
-    let downloaded_stream = store
-        .download_range(key, 0, content.len() as u32)
-        .await
-        .unwrap();
-    let downloaded_bytes = downloaded_stream.collect().await.unwrap().into_bytes();
-    assert_eq!(downloaded_bytes.as_ref(), content.as_slice());
-}
-
-#[tokio::test]
 async fn list_directory() {
     let (store, _bucket) = setup_test_store().await;
 

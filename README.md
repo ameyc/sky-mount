@@ -24,18 +24,18 @@ Sky-Mount's design prioritizes simplicity and performance for common use cases, 
 
 ## **Table of Implemented Functionality**
 
-| Feature | Implemented? | Notes |
-| :--- | :---: | :--- |
-| **Basic FUSE Capabilities** | ✔️ Yes | Core operations like `lookup`, `getattr`, `open`, `read`, `write`, `create`, `release` are implemented. |
-| **Immediate Metadata Visibility** | ✔️ Yes | `ls`, `stat`, `mv` etc. are immediately consistent across all nodes due to the central database. |
-| **Immediate Data Visibility** | ❌ No | **Close-to-Open Consistency**: File content written on one node is only visible to others after the file is closed. This does not meet a strict immediate visibility requirement for data. |
-| **Directories** | ✔️ Yes | Full support for `mkdir`, `rmdir`, and `readdir`. |
-| **Seeked File Reads** | ✔️ Yes | The `read` implementation correctly handles `offset` and `size`, enabling high-throughput reading of large files. |
-| **Race-free Writes** | ✔️ Yes | **"Last writer wins" on close policy is implemented**. This prevents file corruption from interleaved partial writes. The final file is always consistent, but one writer's changes will overwrite another's if they write concurrently. |
-| **Atomic Operations** | ✔️ Yes | `unlink` and `rename` are atomic at the metadata level and use reliable S3 patterns. |
-| **Low Latency (Small Files)** | ✔️ Yes | Metadata lookups and in-memory writes are fast. Reads are subject to S3 network latency. |
-| **High Throughput (Large Files)** | ⚠️ Partially | **Read throughput is high** due to seeked reads. **Write throughput is a major bottleneck**, as the entire file must be buffered in RAM before upload, nevertheless we use async multipart uploads for large files. Not suitable for files larger than system RAM. |
-| **File-level Permissions** | ✔️ Yes | Full support for POSIX-style permissions. `uid`, `gid`, and `mode` are stored and enforced. |
+| Feature                           | Implemented? | Notes (reflects current `S3Fuse` code)                                                                                                                                                                                                    |
+| :-------------------------------- | :----------: | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Basic FUSE Capabilities**       |    ✔️ Yes    | `lookup`, `getattr`, `open`, `create`, `read`, `write`, `flush`, `fsync`, `release`, `mkdir`, `rmdir`, `unlink`, `rename`, `readdir`, `setattr` are present.                                                                              |
+| **Immediate Metadata Visibility** |    ✔️ Yes    | All metadata operations go through the shared Postgres‐backed `MetadataService`; results are visible cluster-wide as soon as the transaction commits.                                                                                     |
+| **Immediate Data Visibility**     |     ❌ No     | Still **close-to-open consistency**: object data becomes readable by other nodes only after the handle that triggered the final `release/fsync` completes the PUT or MPU-completion.                                                      |
+| **Directories**                   |    ✔️ Yes    | Full `mkdir`, `rmdir`, `readdir`; readdir lazily seeds the DB from S3 on first access and then serves from the cache.                                                                                                                     |
+| **Seeked File Reads**             |    ✔️ Yes    | `read` issues range GETs (`download_range`) and streams them, respecting `offset`/`size`.                                                                                                                                                 |
+| **Race-free Writes**              |    ✔️ Yes    | Per-inode `WriteState` serialises writes; “last-writer-wins-on-close” prevents interleaved corruption.                                                                                                                                    |
+| **Atomic Operations**             |    ✔️ Yes    | `rename`/`unlink` are single-step in the DB; S3 side uses copy-then-delete (files) or key-prefix copy (dirs) for atomicity.                                                                                                               |
+| **Low Latency (Small Files)**     |    ✔️ Yes    | Metadata hits are in-mem; small writes buffered then single PUT in `release/fsync`.                                                                                                                                                       |
+| **High Throughput (Large Files)** |    ✔️ Yes    | **Streaming multipart uploads**: once the staging buffer reaches **10 MiB** (`MULTIPART_THRESHOLD`) data is flushed part-by-part; only the threshold plus any remaining tail sits in RAM, eliminating the “buffer-whole-file” bottleneck. |
+| **File-level Permissions**        |    ✔️ Yes    | POSIX `uid/gid/mode` stored in Postgres **and** mirrored to S3 object metadata; `check_permission` enforced on every op.                                                                                                                  |
 
 
 ---

@@ -137,29 +137,14 @@ impl ObjectStore {
         Ok(entries)
     }
 
-    /// Uploads a block of data to S3, automatically choosing between
-    /// a single PutObject and a Multipart Upload based on size.
     pub async fn upload(&self, key: &str, data: Vec<u8>) -> Result<(), FsError> {
-        if data.len() < MULTIPART_THRESHOLD {
-            // Use simple PutObject for smaller files
-            self.s3
-                .put_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .body(ByteStream::from(data))
-                .send()
-                .await?;
-        } else {
-            // Use Multipart Upload for larger files
-            tracing::info!(
-                "upload for {} ({} bytes) is over the MULTIPART_THREADHOLD={}. Switching to multipart uploads",
-                key,
-                data.len(),
-                MULTIPART_THRESHOLD
-            );
-            self.upload_multipart(key, data).await?;
-        }
-
+        self.s3
+            .put_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .body(ByteStream::from(data))
+            .send()
+            .await?;
         Ok(())
     }
 
