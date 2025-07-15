@@ -123,79 +123,31 @@ impl Filesystem for S3Fuse {
     fn lookup(&mut self, req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s,
-            None => return reply.error(libc::EINVAL),
+            None => {
+                reply.error(libc::EINVAL);
+                return;
+            }
         };
 
-        // Look up in metadata service.
-        if let Ok(Some(inode)) = self
+        match self
             .rt
             .block_on(self.metadata_service.lookup(parent_ino, name_str))
         {
-            return reply.entry(&TTL, &inode.to_file_attr(), 0);
-        }
-
-        // If not found, check S3 for lazy indexing.
-        let parent_inode = match self
-            .rt
-            .block_on(self.metadata_service.get_inode(parent_ino))
-        {
-            Ok(Some(inode)) => inode,
-            _ => return reply.error(libc::ENOENT),
-        };
-
-        let parent_s3_path = self.get_s3_key_from_inode(&parent_inode);
-        let child_path = PathBuf::from(parent_s3_path).join(name);
-        let key = path_to_s3_key(&child_path);
-
-        let result = self.rt.block_on(self.object_store.stat_object(&key));
-
-        match result {
-            Ok(object_kind) => {
-                // 4. Found in S3. Create a new inode in our metadata service.
-                let new_ino = path_to_ino(&child_path);
-
-                let (kind, attr) = match object_kind {
-                    ObjectKind::File(meta) => (
-                        FileType::RegularFile,
-                        utils::s3_meta_to_file_attr(new_ino, &key, &meta, req.uid(), req.gid()),
-                    ),
-                    ObjectKind::Directory(Some(meta)) => (
-                        FileType::Directory,
-                        utils::s3_meta_to_file_attr(
-                            new_ino,
-                            &format!("{}/", key),
-                            &meta,
-                            req.uid(),
-                            req.gid(),
-                        ),
-                    ),
-                    ObjectKind::Directory(None) => {
-                        let mut attr = default_root_attr();
-                        attr.ino = new_ino;
-                        attr.uid = req.uid();
-                        attr.gid = req.gid();
-                        (FileType::Directory, attr)
-                    }
-                };
-
-                match self.rt.block_on(self.metadata_service.create_inode(
-                    parent_ino,
-                    new_ino,
-                    name_str,
-                    attr.perm as u32,
-                    kind,
-                    attr.uid,
-                    attr.gid,
-                )) {
-                    Ok(new_inode) => reply.entry(&TTL, &new_inode.to_file_attr(), 0),
-                    Err(e) => {
-                        tracing::error!("Failed to create inode for S3 object '{}': {}", key, e);
-                        reply.error(libc::EIO);
-                    }
-                }
+            Ok(Some(inode)) => {
+                reply.entry(&TTL, &inode.to_file_attr(), 0);
             }
-            Err(_) => {
+            Ok(None) => {
                 reply.error(libc::ENOENT);
+            }
+            Err(e) => {
+                // 4. A database error occurred.
+                tracing::error!(
+                    "lookup: Failed to query inode for name '{}' in parent {}: {}",
+                    name_str,
+                    parent_ino,
+                    e
+                );
+                reply.error(libc::EIO);
             }
         }
     }
@@ -302,74 +254,99 @@ impl Filesystem for S3Fuse {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let mut children = self
+        // We will check S3 and synchronize the directory listing if we haven't
+        // done so for this directory inode yet in our process's lifetime.
+        if !self.seeded_dirs.lock().unwrap().contains(&ino) {
+            // Reconstruct the S3 prefix for the current directory inode.
+            let parent_inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
+                Ok(Some(inode)) => inode,
+                // If we can't even find the inode for the directory we're listing,
+                // it's a critical error.
+                _ => {
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            };
+
+            let mut prefix = self.get_s3_key_from_inode(&parent_inode);
+
+            //    If it's a directory (and not the root), ensure it has a trailing slash
+            //    to make it an unambiguous S3 prefix. e.g., "hanna" -> "hanna/"
+            if parent_inode.is_dir && !prefix.is_empty() {
+                prefix.push('/');
+            }
+
+            // Perform the S3 list operation.
+            let s3_entries = match self.rt.block_on(self.object_store.list_directory(&prefix)) {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::error!("readdir: Failed to list S3 prefix '{}': {}", prefix, e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            };
+
+            // Don't just rely on `is_empty`. We want to do a full sync.
+            // For now, a simple approach is to create any missing entries.
+            // A more robust solution would also handle deletions.
+            if !s3_entries.is_empty() {
+                let to_create = s3_entries
+                    .into_iter()
+                    .map(|e| {
+                        let child_path = PathBuf::from(&prefix).join(&e.name);
+                        let new_ino = path_to_ino(&child_path);
+                        let perm = if e.kind == FileType::Directory {
+                            0o755
+                        } else {
+                            0o644
+                        };
+                        (new_ino, e.name, perm, e.kind, req.uid(), req.gid())
+                    })
+                    .collect::<Vec<_>>();
+
+                if let Err(e) = self
+                    .rt
+                    .block_on(self.metadata_service.create_inodes_batch(ino, to_create))
+                {
+                    tracing::error!(
+                        "readdir: Failed to batch insert inodes for prefix '{}': {}",
+                        prefix,
+                        e
+                    );
+                    // Don't return an error here; we might still have partial data.
+                }
+            }
+
+            // Mark this inode as seeded so we don't hit S3 again for it
+            // during this mount session. The kernel's TTL will handle re-listing.
+            self.seeded_dirs.lock().unwrap().insert(ino);
+        }
+
+        // Now, read from the local database, which is guaranteed to be populated
+        // for the first access.
+        let children = self
             .rt
             .block_on(self.metadata_service.list_directory(ino))
             .unwrap_or_default();
 
-        // Cold start: if no rows yet and not yet seeded, do one S3 list
-        if children.is_empty() && !self.seeded_dirs.lock().unwrap().contains(&ino) {
-            // reconstruct prefix via get_s3_key_from_inode
-            let prefix = self.get_s3_key_from_inode(
-                &self
-                    .rt
-                    .block_on(self.metadata_service.get_inode(ino))
-                    .unwrap()
-                    .unwrap(),
-            );
-            // one S3 call
-            let s3_entries = self
-                .rt
-                .block_on(self.object_store.list_directory(&prefix))
-                .unwrap_or_default();
-
-            // build batch of (ino,name,mode,kind,uid,gid)
-            let to_create = s3_entries
-                .into_iter()
-                .map(|e| {
-                    let child_path = PathBuf::from(&prefix).join(&e.name);
-                    let new_ino = path_to_ino(&child_path);
-                    let perm = if e.kind == FileType::Directory {
-                        0o755
-                    } else {
-                        0o644
-                    };
-                    (new_ino, e.name, perm, e.kind, req.uid(), req.gid())
-                })
-                .collect::<Vec<_>>();
-
-            if !to_create.is_empty() {
-                // one batch insert
-                let _ = self
-                    .rt
-                    .block_on(self.metadata_service.create_inodes_batch(ino, to_create));
-            }
-            // mark it so we don’t do this again
-            self.seeded_dirs.lock().unwrap().insert(ino);
-            // re-read the DB
-            children = self
-                .rt
-                .block_on(self.metadata_service.list_directory(ino))
-                .unwrap_or_default();
-        }
-
-        // Emit "." ".." + rows as before
-        let parent = self
-            .rt
-            .block_on(self.metadata_service.get_inode(ino))
-            .unwrap()
-            .unwrap()
-            .parent_ino as u64;
-        let mut all = vec![
-            (ino, FileType::Directory, ".".into()),
-            (parent, FileType::Directory, "..".into()),
+        // Emit "." ".." and the now-cached directory entries.
+        let parent_ino = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
+            Ok(Some(inode)) => inode.parent_ino as u64,
+            _ => ino, // Fallback to self as parent if lookup fails
+        };
+        let mut all_entries = vec![
+            (ino, FileType::Directory, ".".to_string()),
+            (parent_ino, FileType::Directory, "..".to_string()),
         ];
-        for d in children {
-            all.push((d.ino, d.kind, d.name));
+        for child in children {
+            all_entries.push((child.ino, child.kind, child.name));
         }
-        for (i, (eino, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(eino, (i + 1) as i64, kind, name) {
-                break;
+
+        for (i, (entry_ino, kind, name)) in
+            all_entries.into_iter().enumerate().skip(offset as usize)
+        {
+            if reply.add(entry_ino, (i + 1) as i64, kind, name) {
+                break; // Buffer is full
             }
         }
         reply.ok();

@@ -10,12 +10,6 @@ use time::OffsetDateTime;
 
 // --- Inode Struct and Helpers ---
 
-/**
- *
- * TODOS:
- * 1. Force nlinks = 2 for directory // Partially done: Initial create is 2.
- * 2. Verfiy the mode conversion back and forth.
- */
 #[derive(Debug, Clone)]
 pub struct Inode {
     pub ino: i64,
@@ -93,7 +87,7 @@ pub struct DirEntry {
 
 #[derive(Clone)]
 pub struct MetadataService {
-    pool: PgPool,
+    pub pool: PgPool,
     inodes_table_fqn: String,
 }
 
@@ -470,35 +464,38 @@ impl MetadataService {
         Ok(deleted_inode)
     }
 
-    pub async fn rename_inode(&self, ino: u64, new_parent_ino: u64, new_name: &str) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-
-        // 1. Lock rows and get old inode info
+    pub async fn rename_inode_with_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        ino: u64,
+        new_parent_ino: u64,
+        new_name: &str,
+    ) -> Result<()> {
+        // Lock rows and get old inode info
         let inode_to_move: Inode = sqlx::query(&format!(
             "SELECT * FROM {} WHERE ino = $1 FOR UPDATE",
             self.inodes_table_fqn
         ))
         .bind(ino as i64)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx) // Note: using the transaction
         .await
         .map(|r| Inode::from_row(&r).unwrap())?;
 
         let old_parent_ino = inode_to_move.parent_ino;
 
-        // 2. Get new parent's path
+        // Get new parent's path
         let new_parent_path: Ltree = sqlx::query_scalar(&format!(
             "SELECT path_ltree FROM {} WHERE ino = $1 FOR UPDATE",
             self.inodes_table_fqn
         ))
         .bind(new_parent_ino as i64)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx) // Note: using the transaction
         .await?;
 
-        // 3. Calculate new path_ltree for the moving inode
-        let safe_new_name = new_name.replace('.', "_");
-        let new_path: Ltree = format!("{}.{}", new_parent_path, safe_new_name).parse()?;
+        // Calculate new path_ltree for the moving inode
+        let new_path: Ltree = format!("{}.{}", new_parent_path, ino).parse()?;
 
-        // 4. Update the inode itself
+        // Update the inode itself
         sqlx::query(&format!(
             "UPDATE {} SET parent_ino = $1, name = $2, path_ltree = $3, mtime = NOW(), ctime = NOW() WHERE ino = $4",
             self.inodes_table_fqn
@@ -507,10 +504,10 @@ impl MetadataService {
         .bind(new_name)
         .bind(&new_path)
         .bind(ino as i64)
-        .execute(&mut *tx)
+        .execute(&mut **tx) // Note: using the transaction
         .await?;
 
-        // 5. If it was a directory, update paths of all its descendants
+        // If it was a directory, update paths of all its descendants
         if inode_to_move.is_dir {
             let old_path_str = inode_to_move.path_ltree.to_string();
             let new_path_str = new_path.to_string();
@@ -523,11 +520,11 @@ impl MetadataService {
             .bind(&new_path_str)
             .bind(&inode_to_move.path_ltree)
             .bind(ino as i64)
-            .execute(&mut *tx)
+            .execute(&mut **tx) // Note: using the transaction
             .await?;
         }
 
-        // 6. Update nlink counts if it was a directory and the parent changed
+        // Update nlink counts if it was a directory and the parent changed
         if old_parent_ino != new_parent_ino as i64 && inode_to_move.is_dir {
             // Decrement old parent's nlink
             sqlx::query(&format!(
@@ -535,7 +532,7 @@ impl MetadataService {
                 self.inodes_table_fqn
             ))
             .bind(old_parent_ino)
-            .execute(&mut *tx)
+            .execute(&mut **tx) // Note: using the transaction
             .await?;
 
             // Increment new parent's nlink
@@ -544,10 +541,18 @@ impl MetadataService {
                 self.inodes_table_fqn
             ))
             .bind(new_parent_ino as i64)
-            .execute(&mut *tx)
+            .execute(&mut **tx) // Note: using the transaction
             .await?;
         }
 
+        Ok(())
+    }
+
+    // The original function now becomes a convenience wrapper that creates its own transaction.
+    pub async fn rename_inode(&self, ino: u64, new_parent_ino: u64, new_name: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        self.rename_inode_with_tx(&mut tx, ino, new_parent_ino, new_name)
+            .await?;
         tx.commit().await?;
         Ok(())
     }

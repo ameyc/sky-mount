@@ -153,6 +153,7 @@ fn filesystem_contract_tests() {
     test_scenario_large_file(&base_path.join("large_file"));
     test_scenario_concurrent_writes(&base_path.join("concurrent_writes"));
     test_scenario_permission_denied(&base_path.join("perms_denied"));
+    test_scenario_atomic_rename_rollback(&base_path.join("rollback"));
 
     // --- 4. Automatic Teardown ---
     // The `guard` is dropped here, automatically unmounting and cleaning up.
@@ -430,4 +431,39 @@ fn test_scenario_permission_denied(test_dir: &Path) {
     assert_eq!(fs::read_to_string(&file_path).unwrap(), "secret data");
 
     println!("✅ Scenario OK: Permission Denied");
+}
+
+fn test_scenario_atomic_rename_rollback(test_dir: &Path) {
+    println!("--- Running Scenario: Atomic Rename Rollback ---");
+    fs::create_dir(test_dir).unwrap();
+    let original_path = test_dir.join("original_for_rollback.txt");
+    fs::write(&original_path, "rollback data").unwrap();
+    assert!(
+        original_path.exists(),
+        "Setup failed: original file was not created"
+    );
+    let invalid_move_path = test_dir.join("non_existent_dir/moved.txt");
+
+    let result = fs::rename(&original_path, &invalid_move_path);
+    assert!(
+        result.is_err(),
+        "The rename operation to an invalid location should have failed"
+    );
+    assert!(
+        original_path.exists(),
+        "ROLLBACK FAILED: Original file no longer exists after a failed rename"
+    );
+
+    assert!(
+        !invalid_move_path.exists(),
+        "ROLLBACK FAILED: Destination file was created despite the failed rename"
+    );
+
+    assert_eq!(
+        fs::read_to_string(&original_path).unwrap(),
+        "rollback data",
+        "ROLLBACK FAILED: Original file content was altered"
+    );
+
+    println!("✅ Scenario OK: Atomic Rename Rollback");
 }
