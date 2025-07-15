@@ -1,4 +1,5 @@
 use anyhow::Result;
+use dashmap::{DashMap, DashSet};
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, TimeOrNow,
@@ -39,9 +40,9 @@ pub struct S3Fuse {
     object_store: ObjectStore,
     rt: Runtime,
     metadata_service: MetadataService,
-    seeded_dirs: Mutex<HashSet<u64>>,
+    seeded_dirs: DashSet<u64>,
     next_fh: u64,
-    write_buffers: Mutex<HashMap<u64, Vec<u8>>>,
+    write_buffers: DashMap<u64, Vec<u8>>, //DashMap provides finer grained key level locking
     mount_uid: u32,
     mount_gid: u32,
 }
@@ -55,9 +56,9 @@ impl S3Fuse {
             object_store,
             rt,
             metadata_service,
-            seeded_dirs: Mutex::new(HashSet::new()),
+            seeded_dirs: DashSet::new(),
             next_fh: 1,
-            write_buffers: Mutex::new(HashMap::new()),
+            write_buffers: DashMap::new(),
             mount_uid: 0,
             mount_gid: 0,
         })
@@ -136,7 +137,7 @@ impl Filesystem for S3Fuse {
         match self.rt.block_on(self.metadata_service.get_inode(ino)) {
             Ok(Some(md)) => {
                 let mut attr = md.to_file_attr();
-                if let Some(buf) = self.write_buffers.lock().unwrap().get(&ino) {
+                if let Some(buf) = self.write_buffers.get(&ino) {
                     attr.size = buf.len() as u64;
                     attr.blocks = (attr.size + 511) / 512;
                 }
@@ -236,7 +237,7 @@ impl Filesystem for S3Fuse {
     ) {
         // We will check S3 and synchronize the directory listing if we haven't
         // done so for this directory inode yet in our process's lifetime.
-        if !self.seeded_dirs.lock().unwrap().contains(&ino) {
+        if !self.seeded_dirs.contains(&ino) {
             // Reconstruct the S3 prefix for the current directory inode.
             let parent_inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
                 Ok(Some(inode)) => inode,
@@ -299,7 +300,7 @@ impl Filesystem for S3Fuse {
 
             // Mark this inode as seeded so we don't hit S3 again for it
             // during this mount session. The kernel's TTL will handle re-listing.
-            self.seeded_dirs.lock().unwrap().insert(ino);
+            self.seeded_dirs.insert(ino);
         }
 
         // Now, read from the local database, which is guaranteed to be populated
@@ -425,10 +426,7 @@ impl Filesystem for S3Fuse {
             Ok(inode) => {
                 let fh = self.next_fh;
                 self.next_fh += 1;
-                self.write_buffers
-                    .lock()
-                    .unwrap()
-                    .insert(inode.ino as u64, Vec::new());
+                self.write_buffers.insert(inode.ino as u64, Vec::new());
                 reply.created(
                     &TTL,
                     &inode.to_file_attr(),
@@ -456,8 +454,7 @@ impl Filesystem for S3Fuse {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let mut write_buffers_guard = self.write_buffers.lock().unwrap();
-        let buffer = match write_buffers_guard.get_mut(&ino) {
+        let mut buffer = match self.write_buffers.get_mut(&ino) {
             Some(buffer) => buffer,
             None => return reply.error(libc::EBADF),
         };
@@ -485,7 +482,7 @@ impl Filesystem for S3Fuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let buffer = match self.write_buffers.lock().unwrap().remove(&ino) {
+        let (_, buffer) = match self.write_buffers.remove(&ino) {
             Some(buffer) => buffer,
             None => return reply.ok(),
         };
@@ -551,7 +548,7 @@ impl Filesystem for S3Fuse {
         self.next_fh += 1;
 
         if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
-            self.write_buffers.lock().unwrap().insert(ino, Vec::new());
+            self.write_buffers.insert(ino, Vec::new());
         }
 
         reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
