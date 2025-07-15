@@ -1,8 +1,7 @@
 use anyhow::Result;
-use sqlx::{Executor, PgPool};
 use uuid::Uuid;
 
-use sky_mount::metadata_service::{DirEntry, MetadataService}; // adjust path
+use sky_mount::metadata_service::MetadataService; // adjust path
 
 const DB_URL: &str = "postgresql://fsuser:secret@localhost:5432/fsmeta";
 
