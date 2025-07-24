@@ -75,6 +75,7 @@ impl Inode {
     }
 }
 
+#[derive(Debug)]
 pub struct DirEntry {
     pub ino: u64,
     pub name: String,

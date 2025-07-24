@@ -11,6 +11,9 @@ pub enum FsError {
 
     #[error("Entity not found")]
     NotFound,
+
+    #[error("Invalid file handle")]
+    InvalidHandle,
 }
 
 // A helper to convert generic S3 SDK errors into our FsError::S3 type

@@ -7,6 +7,7 @@ use fuser::{
 use std::{
     ffi::OsStr,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 use time::OffsetDateTime;
@@ -18,6 +19,7 @@ use crate::{
     metadata_service::{Inode, MetadataService},
     object_store::{ObjectStore, ObjectUserMetadata},
     utils,
+    write_manager::WriteManager,
 };
 
 const TTL: Duration = Duration::from_secs(15);
@@ -35,12 +37,12 @@ fn path_to_ino(path: &Path) -> u64 {
 }
 
 pub struct S3Fuse {
-    object_store: ObjectStore,
+    object_store: Arc<ObjectStore>,
     rt: Runtime,
     metadata_service: MetadataService,
     seeded_dirs: DashSet<u64>,
     next_fh: u64,
-    write_buffers: DashMap<u64, Vec<u8>>, //DashMap provides finer grained key level locking
+    write_manager: WriteManager, //DashMap provides finer grained key level locking
     mount_uid: u32,
     mount_gid: u32,
 }
@@ -48,15 +50,16 @@ pub struct S3Fuse {
 impl S3Fuse {
     pub fn new(bucket: String, db_url: &str) -> Result<Self> {
         let rt = Runtime::new()?;
-        let object_store = rt.block_on(ObjectStore::new(bucket.clone()))?;
+        let object_store = Arc::new(rt.block_on(ObjectStore::new(bucket.clone()))?);
         let metadata_service = rt.block_on(MetadataService::new(db_url, &bucket))?;
+        let write_manager = WriteManager::new(object_store.clone())?;
         Ok(Self {
             object_store,
             rt,
             metadata_service,
             seeded_dirs: DashSet::new(),
             next_fh: 1,
-            write_buffers: DashMap::new(),
+            write_manager,
             mount_uid: 0,
             mount_gid: 0,
         })
@@ -135,10 +138,10 @@ impl Filesystem for S3Fuse {
         match self.rt.block_on(self.metadata_service.get_inode(ino)) {
             Ok(Some(md)) => {
                 let mut attr = md.to_file_attr();
-                if let Some(buf) = self.write_buffers.get(&ino) {
-                    attr.size = buf.len() as u64;
-                    attr.blocks = (attr.size + 511) / 512;
-                }
+                //if let Some(buf) = self.write_buffers.get(&ino) {
+                //    attr.size = buf.len() as u64;
+                //    attr.blocks = (attr.size + 511) / 512;
+                //}
                 reply.attr(&TTL, &attr);
             }
             Ok(None) => reply.error(libc::ENOENT),
@@ -158,7 +161,7 @@ impl Filesystem for S3Fuse {
         gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -176,6 +179,7 @@ impl Filesystem for S3Fuse {
             if new_size != inode.size as u64 {
                 if new_size == 0 {
                     let key = self.get_s3_key_from_inode(&inode);
+                    tracing::info!("the new size is 0 for {}. truncating the file", key);
                     if self
                         .rt
                         .block_on(self.object_store.truncate_file(&key))
@@ -189,6 +193,12 @@ impl Filesystem for S3Fuse {
             }
         }
 
+        let mtime_to_set = match mtime {
+            Some(TimeOrNow::SpecificTime(ts)) => Some(OffsetDateTime::from(ts)),
+            Some(TimeOrNow::Now) => Some(OffsetDateTime::now_utc()),
+            None => None,
+        };
+
         let updated_inode = self.rt.block_on(self.metadata_service.update_inode(
             ino,
             size.map(|s| s as i64),
@@ -196,7 +206,7 @@ impl Filesystem for S3Fuse {
             uid.map(|u| u as i32),
             gid.map(|g| g as i32),
             None,
-            None,
+            mtime_to_set,
         ));
 
         match updated_inode {
@@ -424,7 +434,14 @@ impl Filesystem for S3Fuse {
             Ok(inode) => {
                 let fh = self.next_fh;
                 self.next_fh += 1;
-                self.write_buffers.insert(inode.ino as u64, Vec::new());
+                let s3_key_clone = s3_key.clone();
+                if let Err(e) = self
+                    .rt
+                    .block_on(self.write_manager.start_upload(fh, s3_key_clone))
+                {
+                    tracing::error!("Failed to start MPU for key '{}': {}", s3_key, e);
+                    return reply.error(libc::EIO);
+                }
                 reply.created(
                     &TTL,
                     &inode.to_file_attr(),
@@ -444,7 +461,7 @@ impl Filesystem for S3Fuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -452,55 +469,67 @@ impl Filesystem for S3Fuse {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let mut buffer = match self.write_buffers.get_mut(&ino) {
-            Some(buffer) => buffer,
-            None => return reply.error(libc::EBADF),
-        };
-
         let offset = offset as usize;
         let write_end = offset + data.len();
 
         if write_end as u64 > S3_MAX_SIZE {
             return reply.error(libc::E2BIG);
         }
-        if write_end > buffer.len() {
-            buffer.resize(write_end, 0);
+
+        match self.write_manager.write_data(fh, data) {
+            Ok(_) => reply.written(data.len() as u32),
+            Err(e) => {
+                tracing::error!("Write failed for fh={}: {}", fh, e);
+                reply.error(libc::EIO)
+            }
         }
-        buffer[offset..write_end].copy_from_slice(data);
-        reply.written(data.len() as u32);
+        tracing::debug!(
+            "write: ino={}, fh={}, offset={}, size={}",
+            ino,
+            fh,
+            offset,
+            data.len()
+        );
+
+        //if write_end > buffer.len() {
+        //    buffer.resize(write_end, 0);
+        //}
+        //buffer[offset..write_end].copy_from_slice(data);
+        //reply.written(data.len() as u32);
     }
 
     fn release(
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         _flags: i32,
         _lock_owner: Option<u64>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let (_, buffer) = match self.write_buffers.remove(&ino) {
-            Some(buffer) => buffer,
-            None => return reply.ok(),
-        };
+        tracing::debug!("Release called on fh={} ino={}", fh, ino);
+        match self.rt.block_on(self.write_manager.finish_upload(fh)) {
+            Ok(new_size) => {
+                // The upload is complete. Now, update the inode's size and mtime.
+                // This requires getting the final size from S3.
+                let inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
+                    Ok(Some(i)) => i,
+                    _ => return reply.error(libc::ENOENT),
+                };
 
-        let inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
-            Ok(Some(i)) => i,
-            _ => return reply.error(libc::ENOENT),
-        };
-
-        let s3_key = self.get_s3_key_from_inode(&inode);
-        let new_size = buffer.len() as i64;
-
-        match self.rt.block_on(self.object_store.upload(&s3_key, buffer)) {
-            Ok(_) => {
+                tracing::debug!(
+                    "setting final attributes fh={} ino={} new_size={}",
+                    fh,
+                    ino,
+                    new_size
+                );
                 let now = OffsetDateTime::now_utc();
                 if self
                     .rt
                     .block_on(self.metadata_service.update_inode(
                         ino,
-                        Some(new_size),
+                        Some(new_size as i64),
                         None,
                         None,
                         None,
@@ -509,19 +538,17 @@ impl Filesystem for S3Fuse {
                     ))
                     .is_err()
                 {
-                    tracing::error!(
-                        "Failed to update inode metadata after upload for key '{}'",
-                        s3_key
-                    );
+                    tracing::error!("DB metadata update failed for ino '{}'", ino);
                     return reply.error(libc::EIO);
                 }
                 reply.ok();
             }
             Err(e) => {
-                tracing::error!("S3 operation failed on release for key '{}': {}", s3_key, e);
+                tracing::error!("S3 operation failed on release for fh={}: {}", fh, e);
                 reply.error(libc::EIO);
             }
         }
+        tracing::debug!("release call finished. fh={} ino={}", fh, ino)
     }
 
     fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -546,7 +573,18 @@ impl Filesystem for S3Fuse {
         self.next_fh += 1;
 
         if (flags & libc::O_ACCMODE) != libc::O_RDONLY {
-            self.write_buffers.insert(ino, Vec::new());
+            let inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
+                Ok(Some(i)) => i,
+                _ => return reply.error(libc::ENOENT),
+            };
+            let s3_key = self.get_s3_key_from_inode(&inode);
+            if let Err(e) = self
+                .rt
+                .block_on(self.write_manager.start_upload(fh, s3_key.clone()))
+            {
+                tracing::error!("Failed to start MPU on open for key '{}': {}", s3_key, e);
+                return reply.error(libc::EIO);
+            }
         }
 
         reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
@@ -716,7 +754,7 @@ impl Filesystem for S3Fuse {
     ) {
         let name_str = name.to_str().unwrap();
         let newname_str = newname.to_str().unwrap();
-        tracing::info!(
+        tracing::debug!(
             "rename: parent={}, name='{}', newparent={}, newname='{}'",
             parent,
             name_str,
@@ -772,6 +810,8 @@ impl Filesystem for S3Fuse {
                     }
                 };
 
+                tracing::debug!("rename fallback: Directory contents: {:?}", children);
+
                 // Heuristic: If there is exactly one regular file in the directory,
                 // assume that's the one the OS wants to rename.
                 let files: Vec<_> = children
@@ -779,6 +819,11 @@ impl Filesystem for S3Fuse {
                     .filter(|e| e.kind == FileType::RegularFile)
                     .collect();
 
+                tracing::debug!(
+                    "rename fallback: Found {} regular files: {:?}",
+                    files.len(),
+                    files
+                );
                 if files.len() == 1 {
                     let assumed_name = &files[0].name;
                     tracing::warn!(
@@ -877,6 +922,34 @@ impl Filesystem for S3Fuse {
                 reply.error(libc::EIO);
             }
         }
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        // macOS's `cp` command uses `fcopyfile`, which attempts to copy extended attributes.
+        // Our filesystem doesn't support storing xattrs, but returning an error here
+        // causes `cp` to abort the entire copy operation.
+        //
+        // By accepting the call and immediately replying OK, we are telling `cp`
+        // "Yes, I have successfully set that metadata," even though we just ignored it.
+        // This is sufficient to prevent `cp` from failing and allows the otherwise
+        // successful file copy to be finalized.
+
+        let name_str = name.to_str().unwrap_or("");
+        tracing::debug!(
+            "Ignoring setxattr for attribute '{}' to ensure compatibility with `cp`.",
+            name_str
+        );
+
+        reply.ok();
     }
 }
 

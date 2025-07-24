@@ -9,7 +9,7 @@ use fuser::FileType;
 use futures::future::join_all;
 
 // Constants for Multipart Upload
-const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
+pub const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
 const MULTIPART_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB
 
 pub struct ObjectStore {
