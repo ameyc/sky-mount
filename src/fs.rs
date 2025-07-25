@@ -1,5 +1,5 @@
 use anyhow::Result;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, ReplyWrite, Request, TimeOrNow,
@@ -952,34 +952,6 @@ impl Filesystem for S3Fuse {
                 reply.error(libc::EIO);
             }
         }
-    }
-
-    fn setxattr(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        name: &OsStr,
-        _value: &[u8],
-        _flags: i32,
-        _position: u32,
-        reply: ReplyEmpty,
-    ) {
-        // macOS's `cp` command uses `fcopyfile`, which attempts to copy extended attributes.
-        // Our filesystem doesn't support storing xattrs, but returning an error here
-        // causes `cp` to abort the entire copy operation.
-        //
-        // By accepting the call and immediately replying OK, we are telling `cp`
-        // "Yes, I have successfully set that metadata," even though we just ignored it.
-        // This is sufficient to prevent `cp` from failing and allows the otherwise
-        // successful file copy to be finalized.
-
-        let name_str = name.to_str().unwrap_or("");
-        tracing::debug!(
-            "Ignoring setxattr for attribute '{}' to ensure compatibility with `cp`.",
-            name_str
-        );
-
-        reply.ok();
     }
 }
 
