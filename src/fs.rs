@@ -49,10 +49,12 @@ pub struct S3Fuse {
 
 impl S3Fuse {
     pub fn new(bucket: String, db_url: &str) -> Result<Self> {
-        let rt = Runtime::new()?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
         let object_store = Arc::new(rt.block_on(ObjectStore::new(bucket.clone()))?);
         let metadata_service = rt.block_on(MetadataService::new(db_url, &bucket))?;
-        let write_manager = WriteManager::new(object_store.clone())?;
+        let write_manager = WriteManager::new(object_store.clone(), rt.handle().clone())?;
         Ok(Self {
             object_store,
             rt,
@@ -134,14 +136,16 @@ impl Filesystem for S3Fuse {
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
         match self.rt.block_on(self.metadata_service.get_inode(ino)) {
             Ok(Some(md)) => {
                 let mut attr = md.to_file_attr();
-                //if let Some(buf) = self.write_buffers.get(&ino) {
-                //    attr.size = buf.len() as u64;
-                //    attr.blocks = (attr.size + 511) / 512;
-                //}
+                if let Some(_fh) = fh {
+                    if let Some(size) = self.write_manager.get_live_size(_fh) {
+                        attr.size = size as u64;
+                        attr.blocks = (attr.size + 511) / 512;
+                    }
+                }
                 reply.attr(&TTL, &attr);
             }
             Ok(None) => reply.error(libc::ENOENT),
@@ -175,11 +179,12 @@ impl Filesystem for S3Fuse {
             _ => return reply.error(libc::ENOENT),
         };
 
+        tracing::info!("setattr called on ino={} size={:?}", ino, size);
         if let Some(new_size) = size {
             if new_size != inode.size as u64 {
                 if new_size == 0 {
                     let key = self.get_s3_key_from_inode(&inode);
-                    tracing::info!("the new size is 0 for {}. truncating the file", key);
+                    tracing::debug!("the new size is 0 for {}. truncating the file", key);
                     if self
                         .rt
                         .block_on(self.object_store.truncate_file(&key))
@@ -218,13 +223,13 @@ impl Filesystem for S3Fuse {
                         uid: Some(inode.uid as u32),
                         gid: Some(inode.gid as u32),
                     };
-                    if self
-                        .rt
-                        .block_on(self.object_store.replace_metadata(&key, &new_metadata))
-                        .is_err()
-                    {
-                        tracing::warn!("Failed to update S3 metadata for key '{}'", key);
-                    }
+                    //if self
+                    //    .rt
+                    //    .block_on(self.object_store.replace_metadata(&key, &new_metadata))
+                    //    .is_err()
+                    //{
+                    //    tracing::warn!("Failed to update S3 metadata for key '{}'", key);
+                    //}
                 }
                 reply.attr(&TTL, &inode.to_file_attr());
             }
@@ -399,6 +404,7 @@ impl Filesystem for S3Fuse {
             _ => return reply.error(libc::ENOENT),
         };
 
+        tracing::debug!("create called for {}", name_str);
         if !utils::check_permission(&parent_inode.to_file_attr(), req, 2) {
             return reply.error(libc::EACCES);
         }
@@ -525,21 +531,38 @@ impl Filesystem for S3Fuse {
                     new_size
                 );
                 let now = OffsetDateTime::now_utc();
+                let updated_inode = self.rt.block_on(self.metadata_service.update_inode(
+                    ino,
+                    Some(new_size as i64),
+                    None,
+                    None,
+                    None, // mode/uid/gid are not changing here
+                    Some(now),
+                    Some(now), // atime/mtime
+                ));
+
+                let inode = match updated_inode {
+                    Ok(i) => i,
+                    Err(e) => {
+                        tracing::error!("DB metadata update failed for ino '{}': {}", ino, e);
+                        return reply.error(libc::EIO);
+                    }
+                };
+
+                // --- STEP 3: NOW, SAFELY UPDATE THE S3 METADATA ---
+                let key = self.get_s3_key_from_inode(&inode);
+                let metadata = ObjectUserMetadata {
+                    mode: Some(inode.perm as u16),
+                    uid: Some(inode.uid as u32),
+                    gid: Some(inode.gid as u32),
+                };
                 if self
                     .rt
-                    .block_on(self.metadata_service.update_inode(
-                        ino,
-                        Some(new_size as i64),
-                        None,
-                        None,
-                        None,
-                        Some(now),
-                        Some(now),
-                    ))
+                    .block_on(self.object_store.replace_metadata(&key, &metadata))
                     .is_err()
                 {
-                    tracing::error!("DB metadata update failed for ino '{}'", ino);
-                    return reply.error(libc::EIO);
+                    // This is not a fatal error, but worth logging.
+                    tracing::warn!("Failed to update S3 metadata for key '{}' on release", key);
                 }
                 reply.ok();
             }
@@ -565,6 +588,12 @@ impl Filesystem for S3Fuse {
             _ => 0,
         };
 
+        tracing::debug!(
+            "open called on ino={}, attr={:?}, access_mask={}",
+            ino,
+            attr,
+            access_mask
+        );
         if access_mask > 0 && !utils::check_permission(&attr, req, access_mask) {
             return reply.error(libc::EACCES);
         }
@@ -598,6 +627,7 @@ impl Filesystem for S3Fuse {
         _lock_owner: u64,
         reply: ReplyEmpty,
     ) {
+        tracing::debug!("flush called for ino={}", _ino);
         reply.ok();
     }
 
@@ -637,7 +667,7 @@ impl Filesystem for S3Fuse {
             .rt
             .block_on(self.object_store.create_object(&new_dir_key, &metadata))
         {
-            tracing::info!("mkdir failed: {}", e);
+            tracing::debug!("mkdir failed: {}", e);
             return reply.error(libc::EIO);
         }
 
@@ -653,7 +683,7 @@ impl Filesystem for S3Fuse {
         )) {
             Ok(inode) => reply.entry(&TTL, &inode.to_file_attr(), 0),
             Err(e) => {
-                tracing::info!("mkdir failed creating inode: {}", e);
+                tracing::error!("mkdir failed creating inode: {}", e);
                 reply.error(libc::EIO);
             }
         }

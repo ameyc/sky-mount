@@ -35,12 +35,11 @@ pub struct WriteManager {
     // Maps a file handle (`fh`) to its in-progress write state.
     active_writes: DashMap<u64, InProgressWrite>,
     object_store: Arc<ObjectStore>,
-    rt: Runtime,
+    rt: Handle,
 }
 
 impl WriteManager {
-    pub fn new(object_store: Arc<ObjectStore>) -> Result<Self> {
-        let rt = Runtime::new()?;
+    pub fn new(object_store: Arc<ObjectStore>, rt: Handle) -> Result<Self> {
         Ok(Self {
             active_writes: DashMap::new(),
             object_store,
@@ -72,7 +71,7 @@ impl WriteManager {
             completed_parts: Arc::new(Mutex::new(Vec::new())),
             upload_tasks: Vec::new(),
             object_store: self.object_store.clone(),
-            rt_handle: self.rt.handle().clone(),
+            rt_handle: self.rt.clone(),
             total_written: 0,
         };
 
@@ -171,6 +170,29 @@ impl WriteManager {
         let mut final_parts = write_state.completed_parts.lock().await;
         final_parts.sort_by_key(|p| p.part_number);
 
+        tracing::error!(
+            "CRITICAL_DIAGNOSIS: About to complete MPU. Key: '{}'. Number of parts found: {}",
+            &write_state.s3_key,
+            final_parts.len()
+        );
+        // The {:?} formatter will print the contents of the vector, including ETags.
+        tracing::debug!(
+            "CRITICAL_DIAGNOSIS: Parts list being sent to S3: {:?}",
+            final_parts
+        );
+        // --- END DIAGNOSTIC LOGS ---
+
+        // For safety, let's add a check here. This turns the theory into a hard error.
+        if final_parts.is_empty() && final_size > 0 {
+            tracing::error!(
+                "FATAL LOGIC ERROR: Upload tasks finished but no completed parts were collected. Aborting."
+            );
+            self.abort_mpu(&write_state).await?;
+            return Err(FsError::S3(
+                "FATAL: No completed parts found for multipart upload.".into(),
+            ));
+        }
+
         let mpu_parts = CompletedMultipartUpload::builder()
             .set_parts(Some(final_parts.to_vec()))
             .build();
@@ -247,5 +269,13 @@ impl WriteManager {
             .send()
             .await?;
         Ok(())
+    }
+
+    pub fn get_live_size(&self, fh: u64) -> Option<u64> {
+        // We only need a read lock (`get`) which is highly concurrent.
+        self.active_writes.get(&fh).map(|write_state| {
+            // The live size is simply the total we've been tracking.
+            write_state.total_written
+        })
     }
 }
