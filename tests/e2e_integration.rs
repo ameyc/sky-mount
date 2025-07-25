@@ -1,5 +1,6 @@
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+use nix::sys::statvfs;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -430,4 +431,101 @@ fn test_scenario_permission_denied(test_dir: &Path) {
     assert_eq!(fs::read_to_string(&file_path).unwrap(), "secret data");
 
     println!("✅ Scenario OK: Permission Denied");
+}
+
+// Define these constants in your test file to match your implementation
+const VFS_SIZE: u64 = 1 * 1024 * 1024 * 1024 * 1024 * 1024; // 1 Petabyte
+const BLOCK_SIZE: u32 = 4096;
+
+// NEW TEST SCENARIO 1: Fsync and Directory Operations
+// This tests fsync, fsyncdir, opendir, and releasedir.
+fn test_scenario_fsync_and_dir_ops(test_dir: &Path) {
+    println!("--- Running Scenario: Fsync & Dir Ops ---");
+    fs::create_dir(test_dir).unwrap();
+
+    // --- Test fsync ---
+    let file_path = test_dir.join("synced_file.txt");
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .open(&file_path)
+        .unwrap();
+
+    let content1 = "first part";
+    file.write_all(content1.as_bytes()).unwrap();
+
+    // This sync_all() call triggers the `fsync` method in S3Fuse.
+    file.sync_all().expect("fsync failed");
+
+    // After a sync, the metadata should be updated.
+    let metadata_after_sync = fs::metadata(&file_path).unwrap();
+    assert_eq!(metadata_after_sync.len(), content1.len() as u64);
+
+    let content2 = "; second part";
+    file.write_all(content2.as_bytes()).unwrap();
+    drop(file); // This closes the file, triggering `release`.
+
+    // Verify the final content is correct.
+    let final_content = fs::read_to_string(&file_path).unwrap();
+    assert_eq!(final_content, "first part; second part");
+
+    // --- Test opendir, readdir, releasedir, fsyncdir ---
+    // `fs::read_dir` implicitly tests `opendir`, `readdir`, and `releasedir`.
+    let entries: Vec<String> = fs::read_dir(test_dir)
+        .unwrap()
+        .map(|r| r.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(entries, vec!["synced_file.txt"]);
+
+    // Test `fsyncdir` by opening the directory and calling sync on its handle.
+    let dir_handle = File::open(test_dir).unwrap();
+    dir_handle
+        .sync_all()
+        .expect("fsyncdir failed. The call should succeed even if it's a no-op.");
+
+    println!("✅ Scenario OK: Fsync & Dir Ops");
+}
+
+// NEW TEST SCENARIO 2: Filesystem Statistics
+// This tests the `statfs` method.
+fn test_scenario_statfs(mount_point: &Path) {
+    println!("--- Running Scenario: Statfs ---");
+
+    // The `statvfs` function from the `nix` crate calls the underlying statfs/statvfs syscall.
+    let stat = statvfs::statvfs(mount_point).expect("statvfs call failed");
+
+    // Check that the filesystem reports the (virtual) block size and filesystem size.
+    // u64::from() makes the type conversion explicit and safe.
+    assert_eq!(
+        u64::from(stat.block_size()),
+        u64::from(BLOCK_SIZE),
+        "Block size (bsize) does not match"
+    );
+    assert_eq!(
+        u64::from(stat.fragment_size()),
+        u64::from(BLOCK_SIZE),
+        "Fragment size (frsize) does not match"
+    );
+
+    let expected_blocks = VFS_SIZE / (BLOCK_SIZE as u64);
+
+    // --- FIX APPLIED HERE ---
+    // Explicitly convert the return values to u64 to match the type of `expected_blocks`.
+    assert_eq!(
+        u64::from(stat.blocks()),
+        expected_blocks,
+        "Total blocks does not match"
+    );
+    assert_eq!(
+        u64::from(stat.blocks_free()),
+        expected_blocks,
+        "Free blocks does not match"
+    );
+    assert_eq!(
+        u64::from(stat.blocks_available()),
+        expected_blocks,
+        "Available blocks does not match"
+    );
+
+    println!("✅ Scenario OK: Statfs");
 }

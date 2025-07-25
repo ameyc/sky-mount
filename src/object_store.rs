@@ -1,16 +1,22 @@
+use std::{sync::Arc, time::Duration};
+
 use crate::error::FsError;
+use aws_config::{retry::RetryConfig, timeout::TimeoutConfig};
 use aws_sdk_s3::{
     Client,
     operation::head_object::HeadObjectOutput,
     primitives::ByteStream,
     types::{CompletedMultipartUpload, CompletedPart, Delete, MetadataDirective, ObjectIdentifier},
 };
+
 use fuser::FileType;
 use futures::future::join_all;
+use tokio::sync::Semaphore;
 
 // Constants for Multipart Upload
 const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
 const MULTIPART_THRESHOLD: usize = 10 * 1024 * 1024; // 10MB
+const MAX_CONCURRENT_UPLOADS: usize = 12;
 
 pub struct ObjectStore {
     pub s3: Client,
@@ -41,7 +47,18 @@ pub struct ObjectUserMetadata {
 // NOTE: This can be made a generic non-S3 specific trait to be implemented for various clients.
 impl ObjectStore {
     pub async fn new(bucket: String) -> Result<Self, FsError> {
-        let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        let retry_config = RetryConfig::adaptive().with_max_attempts(5);
+
+        let timeout_config = TimeoutConfig::builder()
+            .connect_timeout(Duration::from_secs(20))
+            .read_timeout(Duration::from_secs(120))
+            .build();
+
+        let conf = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .retry_config(retry_config)
+            .timeout_config(timeout_config)
+            .load()
+            .await;
         let s3 = Client::new(&conf);
 
         s3.head_bucket().bucket(&bucket).send().await.map_err(|e| {
@@ -353,6 +370,7 @@ impl ObjectStore {
             .upload_id
             .ok_or_else(|| FsError::S3("S3 did not return an upload ID".into()))?;
 
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS)); // <-- 2. CREATE THE SEMAPHORE
         let mut upload_tasks = Vec::new();
 
         for (i, chunk) in data.chunks(MIN_PART_SIZE).enumerate() {
@@ -362,6 +380,8 @@ impl ObjectStore {
             let key_clone = key.to_string();
             let upload_id_clone = upload_id.clone();
             let chunk_data = chunk.to_vec();
+
+            let permit_semaphore = Arc::clone(&semaphore);
 
             let task = tokio::task::spawn(async move {
                 // Map the S3 SDK error to our custom FsError for a consistent return type.
@@ -376,6 +396,7 @@ impl ObjectStore {
                     .await
                     .map_err(|e| FsError::S3(e.to_string()))?;
 
+                let _permit = permit_semaphore.acquire().await.expect("Semaphore closed");
                 // ETag is optional in the response, but required for CompletedPart.
                 // We must handle the case where it's missing.
                 let e_tag = part_resp.e_tag.ok_or_else(|| {

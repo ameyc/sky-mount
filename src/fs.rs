@@ -2,7 +2,7 @@ use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use std::{
     ffi::OsStr,
@@ -22,6 +22,8 @@ use crate::{
 
 const TTL: Duration = Duration::from_secs(15);
 const S3_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024 * 1024; // 5 TiB
+const VFS_SIZE: u64 = 1 * 1024 * 1024 * 1024 * 1024 * 1024; // 1 Petabyte
+const BLOCK_SIZE: u32 = 4096;
 
 fn path_to_ino(path: &Path) -> u64 {
     // Inode 1 is special (root). We dont ever generate it.
@@ -99,6 +101,17 @@ impl Filesystem for S3Fuse {
         Ok(())
     }
 
+    /// Looks up a file or directory by name within a parent directory.
+    ///
+    /// This method is called by the kernel to resolve path components. It queries
+    /// the metadata service for the inode corresponding to `name` within `parent_ino`.
+    ///
+    /// # Arguments
+    /// * `_req` - The FUSE request (unused).
+    /// * `parent_ino` - The inode number of the parent directory.
+    /// * `name` - The name of the file or directory to look up.
+    /// * `reply` - The reply handle to send the entry data back to the kernel.
+    ///
     fn lookup(&mut self, _req: &Request<'_>, parent_ino: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s,
@@ -131,6 +144,17 @@ impl Filesystem for S3Fuse {
         }
     }
 
+    /// Retrieves file attributes for a given inode.
+    ///
+    /// This method is called to get metadata about a file or directory (e.g., size, permissions,
+    /// modification times). It queries the metadata service for the inode. If the file is
+    /// currently being written to (has a buffered write), its size will reflect the buffered data.
+    ///
+    /// # Arguments
+    /// * `_req` - The FUSE request (unused).
+    /// * `ino` - The inode number of the file or directory.
+    /// * `_fh` - The file handle (optional, unused).
+    /// * `reply` - The reply handle to send the attributes back to the kernel.
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.rt.block_on(self.metadata_service.get_inode(ino)) {
             Ok(Some(md)) => {
@@ -149,6 +173,24 @@ impl Filesystem for S3Fuse {
         }
     }
 
+    /// Sets file attributes for a given inode.
+    ///
+    /// This method is used to change properties like mode (permissions), UID, GID, or size.
+    /// If the size is set to 0, it triggers an S3 truncate operation. Other size changes
+    /// are not supported for simplicity (requires partial S3 object updates).
+    /// Permission/ownership changes are also propagated to S3 user metadata.
+    ///
+    /// # Arguments
+    /// * `_req` - The FUSE request (unused).
+    /// * `ino` - The inode number of the file or directory to modify.
+    /// * `mode` - Optional new file mode (permissions).
+    /// * `uid` - Optional new user ID.
+    /// * `gid` - Optional new group ID.
+    /// * `size` - Optional new size. Only `0` is explicitly handled as truncate.
+    /// * `_atime`, `_mtime`, `_ctime`, `_crtime`, `_chgtime`, `_bkuptime` - Various time attributes (unused).
+    /// * `_fh` - The file handle (optional, unused).
+    /// * `_flags` - Flags for setting attributes (unused).
+    /// * `reply` - The reply handle to send the updated attributes back to the kernel.
     fn setattr(
         &mut self,
         _req: &Request<'_>,
@@ -225,6 +267,20 @@ impl Filesystem for S3Fuse {
         }
     }
 
+    /// Reads directory contents.
+    ///
+    /// This method first checks if the directory has been "seeded" (its contents
+    /// synchronized with S3) during this mount session. If not, it lists objects
+    /// in S3 using the directory's S3 prefix and batch-inserts any new entries
+    /// into the database. After seeding (or if already seeded), it reads the
+    /// children from the local database and sends them back to the kernel.
+    ///
+    /// # Arguments
+    /// * `req` - The FUSE request (used for UID/GID when creating new inodes).
+    /// * `ino` - The inode number of the directory to read.
+    /// * `_fh` - The file handle (unused).
+    /// * `offset` - The offset from which to start reading (for pagination).
+    /// * `reply` - The reply handle to send directory entries back to the kernel.
     fn readdir(
         &mut self,
         req: &Request<'_>,
@@ -877,6 +933,129 @@ impl Filesystem for S3Fuse {
                 reply.error(libc::EIO);
             }
         }
+    }
+
+    fn opendir(&mut self, req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
+            Ok(Some(i)) => i,
+            _ => return reply.error(libc::ENOENT),
+        };
+
+        // Directories are typically checked for read permission on open.
+        if !utils::check_permission(&inode.to_file_attr(), req, 4) {
+            return reply.error(libc::EACCES);
+        }
+
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        reply.opened(fh, 0); // No special flags needed.
+    }
+
+    fn releasedir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: i32,
+        reply: ReplyEmpty,
+    ) {
+        // If we were caching directory listings based on the file handle (fh),
+        // we would clean that up here. For now, it's a no-op.
+        reply.ok();
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // Check if there's a write buffer for this inode. If not, the file is not dirty.
+        let buffer = match self.write_buffers.get(&ino) {
+            Some(buffer) => buffer.value().clone(), // Clone the buffer to upload it
+            None => {
+                // Nothing to flush, which is a success case.
+                return reply.ok();
+            }
+        };
+
+        // If we have a buffer, we must flush it to S3.
+        let inode = match self.rt.block_on(self.metadata_service.get_inode(ino)) {
+            Ok(Some(i)) => i,
+            _ => return reply.error(libc::ENOENT),
+        };
+
+        let s3_key = self.get_s3_key_from_inode(&inode);
+        let new_size = buffer.len() as i64;
+
+        match self.rt.block_on(self.object_store.upload(&s3_key, buffer)) {
+            Ok(_) => {
+                let now = OffsetDateTime::now_utc();
+                // Update metadata in the database.
+                if self
+                    .rt
+                    .block_on(self.metadata_service.update_inode(
+                        ino,
+                        Some(new_size),
+                        None,      // mode
+                        None,      // uid
+                        None,      // gid
+                        Some(now), // mtime
+                        Some(now), // ctime
+                    ))
+                    .is_err()
+                {
+                    tracing::error!(
+                        "fsync: Failed to update inode metadata after upload for key '{}'",
+                        s3_key
+                    );
+                    return reply.error(libc::EIO);
+                }
+                reply.ok();
+            }
+            Err(e) => {
+                tracing::error!("fsync: S3 upload failed for key '{}': {}", s3_key, e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // For S3, directory operations are generally atomic.
+        // There isn't a separate "data" buffer to sync for directories in our design.
+        // We could force a re-sync with S3 here if needed, but for now, this is sufficient.
+        reply.ok();
+    }
+
+    // Method 3: statfs
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        // Since S3 provides virtually unlimited storage, we can report very large
+        //, static values. Applications use this to check for available space.
+        let total_blocks = VFS_SIZE / (BLOCK_SIZE as u64);
+
+        // You could implement logic to estimate used space by summing the sizes
+        // of all inodes, but this can be slow. A simpler approach is to report
+        // a huge amount of free space.
+
+        reply.statfs(
+            total_blocks, // `blocks`: Total data blocks in filesystem.
+            total_blocks, // `bfree`: Free blocks in filesystem.
+            total_blocks, // `bavail`: Free blocks available to non-super-user.
+            u64::MAX,     // `files`: Total file nodes in filesystem.
+            u64::MAX,     // `ffree`: Free file nodes in filesystem.
+            BLOCK_SIZE,   // `bsize`: Optimal transfer block size.
+            255,          // `namelen`: Maximum length of filenames.
+            BLOCK_SIZE,   // frsize = fundamental block size
+        );
     }
 }
 
