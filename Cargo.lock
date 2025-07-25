@@ -382,6 +382,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-smithy-client"
+version = "0.60.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "755df81cd785192ee212110f3df2b478704ddd19e7ac91263d23286c26384c4d"
+
+[[package]]
 name = "aws-smithy-eventstream"
 version = "0.60.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2794,6 +2800,7 @@ dependencies = [
  "anyhow",
  "aws-config",
  "aws-sdk-s3",
+ "aws-smithy-client",
  "bincode",
  "clap",
  "crossbeam-channel",
@@ -2803,6 +2810,7 @@ dependencies = [
  "fuser",
  "futures",
  "libc",
+ "nix 0.30.1",
  "seahash",
  "serde",
  "sqlx",

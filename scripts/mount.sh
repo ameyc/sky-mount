@@ -165,6 +165,7 @@ info "The filesystem will run in this terminal. Press Ctrl-C to unmount."
 
 # Execute the mount command.
 export DATABASE_URL="${DATABASE_URL}"
+export RUST_LOG="sky_mount=debug"
 "${BINARY_PATH}" "${S3_BUCKET}" "${DATABASE_URL}" "${MOUNT_POINT}"
 
 # This part will only be reached after the user presses Ctrl-C
